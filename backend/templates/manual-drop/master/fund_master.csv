@@ -1,0 +1,5 @@
+fund_id,fund_code,fund_name,fund_type,theme,tracking_target,fund_company,tradable_on_exchange,fee_rate,inception_date
+f1,159995,国证芯片ETF,ETF,半导体,国证芯片指数,国证基金,true,0.50,2022-03-15
+f2,012345,半导体设备联接A,联接基金,半导体,半导体设备主题ETF联接,远见基金,false,0.60,2023-03-15
+f3,560880,创新药产业ETF,ETF,创新药,创新药产业指数,医疗创新基金,true,0.45,2022-03-15
+f4,018888,AI算力先锋混合,主动基金,AI 算力基础设施,主动配置算力基础设施产业链,前沿成长基金,false,1.20,2024-06-28

@@ -1,0 +1,4 @@
+fund_id,trade_date,min_holding_days,max_holding_days,redemption_fee_rate,rule_text,is_free_threshold,priority_rank,source_name,source_batch_id,data_version,quality_status
+semiconductor-1,2026-04-22,0,6,1.5000,"持有少于 7 天，赎回费 1.50%。",false,1,manual-drop,manual-20260422,manual-drop-v1,complete
+semiconductor-1,2026-04-22,7,29,0.5000,"持有不少于 7 天且少于 30 天，赎回费 0.50%。",false,2,manual-drop,manual-20260422,manual-drop-v1,complete
+semiconductor-1,2026-04-22,30,,0.0000,"持有不少于 30 天，免赎回费。",true,3,manual-drop,manual-20260422,manual-drop-v1,complete

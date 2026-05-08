@@ -1,0 +1,5 @@
+industry_id,fund_id,mapping_type,priority_rank
+semiconductor,f1,theme,1
+semiconductor,f2,theme,2
+innovative-medicine,f3,theme,1
+ai-infra,f4,theme,1

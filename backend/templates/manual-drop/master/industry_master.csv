@@ -1,0 +1,17 @@
+industry_id,industry_name,display_name
+semiconductor,半导体,半导体
+innovative-medicine,创新药,创新药
+ai-infra,AI算力基础设施,AI算力基础设施
+chemical,化工新材料,化工新材料
+gaming,游戏传媒,游戏传媒
+global-qdii,全球科技QDII,全球科技QDII
+defense-military,军工,军工
+commercial-space,商业卫星,商业卫星
+aerospace,航天航空,航天航空
+memory-chip,芯片存储,芯片存储
+new-energy,新能源,新能源
+ev-battery,新能源车与电池,新能源车与电池
+photovoltaic,光伏,光伏
+energy-storage,储能,储能
+robotics,机器人,机器人
+low-altitude,低空经济,低空经济

@@ -1,0 +1,2 @@
+fund_id,trade_date,subscription_fee_rate,purchase_fee_rate,management_fee_rate,custodian_fee_rate,sales_service_fee_rate,fee_rule_text,source_name,source_batch_id,data_version,quality_status
+semiconductor-1,2026-04-22,0.1500,0.1500,0.5000,0.1000,0.0000,"申购费 0.15%，管理费 0.50%，托管费 0.10%。",manual-drop,manual-20260422,manual-drop-v1,complete
