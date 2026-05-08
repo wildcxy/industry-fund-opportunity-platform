@@ -1,6 +1,6 @@
 # 新电脑拉取后启动指南
 
-这份说明适用于从 GitHub 仓库 clone 下来的源码目录。
+这份说明适用于从 GitHub clone 下来的源码目录。
 
 仓库地址：
 
@@ -17,7 +17,7 @@ https://github.com/wildcxy/industry-fund-opportunity-platform.git
 - Python 3.11，确保可以运行 `python`
 - PostgreSQL
 
-项目初始化脚本默认使用下面的数据库配置：
+默认数据库配置：
 
 ```text
 PostgreSQL 用户：postgres
@@ -26,7 +26,7 @@ PostgreSQL 密码：123456
 连接串：postgresql://postgres:123456@localhost:5432/game_data
 ```
 
-如果你的 PostgreSQL 密码或安装路径不同，可以在运行初始化脚本时传参数覆盖。
+如果你的 PostgreSQL 密码不是 `123456`，后面恢复数据库和写 `.env` 时需要同步改成你的本机密码。
 
 ## 2. 拉取仓库
 
@@ -35,39 +35,69 @@ git clone https://github.com/wildcxy/industry-fund-opportunity-platform.git
 cd industry-fund-opportunity-platform
 ```
 
-## 3. 初始化项目
+后续命令都在仓库根目录执行。
 
-在仓库根目录运行：
+## 3. 安装前端依赖
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\portable-setup-windows.ps1
+npm.cmd install
 ```
 
-脚本会自动完成：
+## 4. 安装后端依赖
 
-- 写入 `backend\.env`
-- 创建或复用 `game_data` 数据库
-- 导入 `db\game_data_dump.sql`
-- 安装后端 Python 依赖到 `backend\.packages`
-- 执行 `npm.cmd install`
-- 初始化 `runtime\` 运行目录
-
-如果 PostgreSQL 不是默认路径，可以显式指定：
+项目后端依赖安装到 `backend\.packages`，启动脚本会从这里加载依赖。
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\portable-setup-windows.ps1 `
+python -m pip install -r .\backend\requirements.txt -t .\backend\.packages
+```
+
+## 5. 初始化运行目录
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\backend\scripts\init-runtime-directories.ps1
+```
+
+这个脚本会创建 `runtime\logs`、`runtime\data-archive`、`runtime\manual-drop` 等本地运行目录。
+
+## 6. 配置后端环境变量
+
+复制示例配置：
+
+```powershell
+Copy-Item .\backend\.env.example .\backend\.env
+```
+
+然后打开 `backend\.env`，至少确认这一行和你的 PostgreSQL 配置一致：
+
+```text
+DATABASE_URL=postgresql://postgres:123456@localhost:5432/game_data
+```
+
+如果你使用默认配置，可以直接用上面的值。
+
+## 7. 恢复数据库
+
+使用仓库里的数据库备份恢复 `game_data`：
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\db\restore-db.ps1
+```
+
+如果 PostgreSQL 密码不同：
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\db\restore-db.ps1 -DatabasePassword "你的密码"
+```
+
+如果 PostgreSQL 不在默认安装路径，可以显式指定：
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\db\restore-db.ps1 `
   -PsqlExe "C:\Program Files\PostgreSQL\18\bin\psql.exe" `
   -CreatedbExe "C:\Program Files\PostgreSQL\18\bin\createdb.exe"
 ```
 
-如果 Python 不在 PATH 里，可以显式指定：
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\portable-setup-windows.ps1 `
-  -PythonExe "C:\Path\To\python.exe"
-```
-
-## 4. 启动后端
+## 8. 启动后端
 
 新开一个 PowerShell 窗口，在仓库根目录运行：
 
@@ -87,7 +117,7 @@ http://127.0.0.1:8000
 http://127.0.0.1:8000/health
 ```
 
-## 5. 启动前端
+## 9. 启动前端
 
 再新开一个 PowerShell 窗口，在仓库根目录运行：
 
@@ -107,17 +137,11 @@ http://127.0.0.1:3000
 http://127.0.0.1:3000/portfolio
 ```
 
-## 6. 常见问题
+## 常见问题
 
 ### 找不到 `.packages`
 
 说明后端依赖还没有安装。重新运行：
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\portable-setup-windows.ps1
-```
-
-或者只补装 Python 依赖：
 
 ```powershell
 python -m pip install -r .\backend\requirements.txt -t .\backend\.packages
@@ -146,9 +170,3 @@ npm.cmd run dev -- -p 3001
 ```text
 http://127.0.0.1:3001
 ```
-
-### 不要使用 `source\` 路径
-
-从 GitHub clone 下来的仓库根目录就是源码根目录，所以命令都在仓库根目录执行。
-
-`README_FIRST.md` 里的 `source\` 路径是旧的便携迁移包场景使用的。
