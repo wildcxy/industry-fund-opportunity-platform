@@ -6,6 +6,7 @@ import { fetchBackendJson } from "@/lib/backend-api";
 import { formatAum, formatPercent, formatRate } from "@/lib/format";
 import { buildFundDataQualityNotes, buildShortTermReview } from "@/lib/fund-review";
 import { FundHoldingView, FundListItem } from "@/types";
+import { StrategyStateNote } from "./strategy-state-note";
 
 function hasNumber(value: number | null | undefined): value is number {
   return value !== null && value !== undefined && Number.isFinite(value);
@@ -63,7 +64,11 @@ export default async function FundDetailPage({ params }: { params: Promise<{ fun
   const qualityNotes = buildFundDataQualityNotes(fund);
   const sameThemeFunds = allFunds
     .filter((item) => item.fundCode !== fund.fundCode && item.theme === fund.theme)
-    .sort((left, right) => (right.return3m ?? 0) - (left.return3m ?? 0))
+    .sort((left, right) => {
+      const leftValue = hasNumber(left.return3m) ? left.return3m : Number.NEGATIVE_INFINITY;
+      const rightValue = hasNumber(right.return3m) ? right.return3m : Number.NEGATIVE_INFINITY;
+      return rightValue - leftValue;
+    })
     .slice(0, 4);
 
   return (
@@ -99,6 +104,8 @@ export default async function FundDetailPage({ params }: { params: Promise<{ fun
         <MetricCard label="最大回撤 / 波动率" value={`${percent(fund.maxDrawdown)} / ${percent(fund.volatility)}`} note="用于判断长期持有过程中的心理压力。" />
         <MetricCard label="规模 / 成立年限" value={`${moneyScale(fund.aum)} / ${fund.foundedYears ? `${fund.foundedYears} 年` : "--"}`} note="规模过小或成立时间过短都需要额外谨慎。" />
       </section>
+
+      <StrategyStateNote fundId={fund.fundId} fundCode={fund.fundCode} fundName={fund.fundName} />
 
       <section className="panel p-6">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">

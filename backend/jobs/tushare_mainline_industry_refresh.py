@@ -27,7 +27,8 @@ _LAST_FUND_PORTFOLIO_CALL_AT = 0.0
 THEME_KEYWORDS: dict[str, tuple[str, ...]] = {
     "semiconductor": ("半导体", "芯片", "集成电路", "晶圆", "封测", "材料", "设备"),
     "memory-chip": ("存储", "DRAM", "NAND", "HBM", "闪存", "内存", "芯片"),
-    "ai-infra": ("CPO", "光模块", "算力", "人工智能", "AI", "服务器", "通信设备", "云计算"),
+    "ai-infra": ("算力", "人工智能", "AI", "服务器", "云计算"),
+    "cpo-optical-communication": ("CPO", "光模块", "光通信", "通信设备", "高速互联"),
     "new-energy": ("新能源", "锂电", "电池", "光伏", "储能", "风电"),
     "defense-military": ("军工", "国防", "航空", "航天", "卫星", "船舶"),
     "commercial-space": ("商业航天", "卫星", "航天", "火箭", "低空"),

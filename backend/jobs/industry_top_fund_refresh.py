@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date
+import time
+from collections import defaultdict
+from datetime import date, datetime
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -17,6 +19,7 @@ JOB_NAME = "industry_top_fund_refresh"
 DATA_VERSION = "tushare-industry-top10-v1"
 MAX_FUNDS_PER_INDUSTRY = 10
 MAX_CANDIDATES_PER_INDUSTRY = 80
+CPO_PROXY_CANDIDATE_CAP = 40
 
 
 @dataclass(frozen=True)
@@ -42,7 +45,13 @@ class IndustryProfile:
 INDUSTRY_PROFILES: tuple[IndustryProfile, ...] = (
     IndustryProfile("semiconductor", "半导体", ("半导体", "芯片", "集成电路"), ("ETF", "指数", "联接")),
     IndustryProfile("memory-chip", "芯片存储", ("存储", "芯片", "半导体"), ("存储", "芯片", "ETF", "指数")),
-    IndustryProfile("ai-infra", "AI算力基础设施", ("人工智能", "AI", "算力", "CPO", "云计算", "机器人"), ("AI", "人工智能", "ETF", "指数")),
+    IndustryProfile("ai-infra", "AI算力基础设施", ("人工智能", "AI", "算力", "云计算", "机器人"), ("AI", "人工智能", "ETF", "指数")),
+    IndustryProfile(
+        "cpo-optical-communication",
+        "CPO光通信",
+        ("CPO", "光模块", "光通信", "光纤", "光缆", "光器件", "通信设备", "5G通信"),
+        ("光模块", "光通信", "光纤", "光缆", "5G", "通信", "ETF", "指数"),
+    ),
     IndustryProfile("robotics", "机器人", ("机器人", "智能制造", "高端制造"), ("机器人", "ETF", "指数")),
     IndustryProfile("defense-military", "军工", ("军工", "国防", "军民", "中航", "航天", "航空"), ("军工", "国防", "ETF", "指数")),
     IndustryProfile("commercial-space", "商业卫星", ("商业航天", "卫星", "航天", "军工"), ("卫星", "航天", "军工", "ETF", "指数")),
@@ -59,6 +68,14 @@ INDUSTRY_PROFILES: tuple[IndustryProfile, ...] = (
 )
 
 SUPPLEMENTAL_PROFILE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "cpo-optical-communication": (
+        "5G",
+        "通信ETF",
+        "通信主题",
+        "通信设备",
+        "国证通信",
+        "全指通信",
+    ),
     "global-qdii": (
         "QDII",
         "纳斯达克",
@@ -94,9 +111,71 @@ SUPPLEMENTAL_PROFILE_KEYWORDS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+CPO_EXCLUDE_KEYWORDS = (
+    "通信服务",
+    "卫星通信",
+    "商用卫星",
+    "港股通",
+    "信息技术综合",
+    "科技传媒通信150",
+)
+
+CPO_OPTICAL_CHAIN_STOCKS: dict[str, str] = {
+    "300308.SZ": "中际旭创",
+    "300502.SZ": "新易盛",
+    "300394.SZ": "天孚通信",
+    "002281.SZ": "光迅科技",
+    "300570.SZ": "太辰光",
+    "688205.SH": "德科立",
+    "688498.SH": "源杰科技",
+    "300548.SZ": "博创科技",
+    "002463.SZ": "沪电股份",
+    "300476.SZ": "胜宏科技",
+    "600522.SH": "中天科技",
+    "600487.SH": "亨通光电",
+    "600498.SH": "烽火通信",
+    "601869.SH": "长飞光纤",
+    "300913.SZ": "兆龙互连",
+}
+
+_LAST_FUND_PORTFOLIO_CALL_AT = 0.0
+
 
 def _normalize_code(value: Any) -> str:
     return str(value or "").strip().split(".")[0].zfill(6)
+
+
+def _normalize_stock_code(value: Any) -> str | None:
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return None
+    if "." in raw:
+        code, exchange = raw.split(".", 1)
+        if exchange in {"SH", "SZ", "BJ"}:
+            return f"{code.zfill(6)}.{exchange}"
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) < 6:
+        return None
+    code = digits[:6]
+    if code.startswith(("6", "9")):
+        exchange = "SH"
+    elif code.startswith(("8", "4")):
+        exchange = "BJ"
+    else:
+        exchange = "SZ"
+    return f"{code}.{exchange}"
+
+
+def _safe_date(value: Any) -> date | None:
+    raw = str(value or "").strip()
+    if not raw or raw in {"nan", "None", "--"}:
+        return None
+    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 def _as_float(value: Any) -> float | None:
@@ -109,6 +188,23 @@ def _as_float(value: Any) -> float | None:
     if number != number:
         return None
     return number
+
+
+def _cached_aum_for_fund(cur, fund_id: str, trade_date: date) -> float | None:
+    cur.execute(
+        """
+        select aum
+        from fund_daily_metrics
+        where fund_id = %s
+          and trade_date <= %s
+          and aum is not null
+        order by trade_date desc, updated_at desc
+        limit 1
+        """,
+        (fund_id, trade_date),
+    )
+    row = cur.fetchone()
+    return _as_float(row["aum"]) if row else None
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -144,7 +240,103 @@ def _candidate_text(row: dict[str, Any]) -> str:
 
 
 def _is_excluded(text: str, profile: IndustryProfile) -> bool:
+    if profile.industry_id == "cpo-optical-communication" and any(keyword.upper() in text for keyword in CPO_EXCLUDE_KEYWORDS):
+        return True
     return any(keyword.upper() in text for keyword in profile.exclude_keywords)
+
+
+def _fund_ts_code(fund_code: str | None) -> str | None:
+    if not fund_code:
+        return None
+    return f"{str(fund_code).strip().split('.')[0].zfill(6)}.OF"
+
+
+def _portfolio_optical_exposure(provider: ProProvider, fund_code: str, cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    normalized = _normalize_code(fund_code)
+    if normalized in cache:
+        return cache[normalized]
+
+    global _LAST_FUND_PORTFOLIO_CALL_AT
+    ts_code = _fund_ts_code(normalized)
+    wait_seconds = 1.15 - (time.monotonic() - _LAST_FUND_PORTFOLIO_CALL_AT)
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+    _LAST_FUND_PORTFOLIO_CALL_AT = time.monotonic()
+
+    try:
+        frame = provider.fund_portfolio(
+            ts_code=ts_code,
+            fields="ts_code,ann_date,end_date,symbol,mkv,amount,stk_mkv_ratio,stk_float_ratio",
+        )
+        rows = frame.to_dict("records") if hasattr(frame, "to_dict") else []
+    except Exception as exc:
+        result = {"ratio": None, "matched": [], "error": str(exc)}
+        cache[normalized] = result
+        return result
+
+    grouped: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        report_date = _safe_date(row.get("end_date") or row.get("ann_date"))
+        stock_code = _normalize_stock_code(row.get("symbol"))
+        if report_date and stock_code:
+            grouped[report_date].append({**row, "stockCode": stock_code})
+    if not grouped:
+        result = {"ratio": None, "matched": [], "error": None}
+        cache[normalized] = result
+        return result
+
+    latest_date = max(grouped)
+    matched = []
+    ratio = 0.0
+    for row in grouped[latest_date]:
+        stock_code = row["stockCode"]
+        if stock_code not in CPO_OPTICAL_CHAIN_STOCKS:
+            continue
+        weight = _as_float(row.get("stk_mkv_ratio")) or _as_float(row.get("stk_float_ratio")) or 0.0
+        ratio += max(weight, 0.0)
+        matched.append(
+            {
+                "stockCode": stock_code,
+                "stockName": CPO_OPTICAL_CHAIN_STOCKS[stock_code],
+                "weight": round(max(weight, 0.0), 4),
+            }
+        )
+    result = {
+        "ratio": round(ratio, 4),
+        "matched": sorted(matched, key=lambda item: item["weight"], reverse=True)[:8],
+        "reportDate": latest_date.isoformat(),
+        "error": None,
+    }
+    cache[normalized] = result
+    return result
+
+
+def _cpo_proxy_score(row: dict[str, Any], provider: ProProvider, exposure_cache: dict[str, dict[str, Any]]) -> float:
+    text = _candidate_text(row)
+    if any(keyword.upper() in text for keyword in CPO_EXCLUDE_KEYWORDS):
+        return -999.0
+    direct_keywords = ("CPO", "光模块", "光通信", "光纤", "光缆", "光器件")
+    direct_hits = sum(1 for keyword in direct_keywords if keyword.upper() in text)
+    communication_proxy = any(keyword.upper() in text for keyword in ("通信设备", "通信ETF", "通信主题", "5G通信", "国证通信", "全指通信"))
+    if direct_hits == 0 and not communication_proxy:
+        return -999.0
+
+    code = _normalize_code(row.get("ts_code"))
+    exposure = _portfolio_optical_exposure(provider, code, exposure_cache)
+    ratio = exposure.get("ratio")
+    if direct_hits == 0 and (ratio is None or float(ratio) < 8.0):
+        return -999.0
+
+    score = 30.0 + direct_hits * 18.0
+    if communication_proxy:
+        score += 12.0
+    if ratio is not None:
+        score += min(38.0, float(ratio) * 1.4)
+    if "ETF" in text:
+        score += 5.0
+    if "指数" in text or "联接" in text:
+        score += 4.0
+    return score
 
 
 def _match_candidate_score(row: dict[str, Any], profile: IndustryProfile) -> float:
@@ -318,8 +510,8 @@ def _upsert_fund_daily_metrics(cur, trade_date: date, batch_id: str, row: dict[s
             row.get("latest_nav_date"),
             row.get("previous_nav_date"),
             row["founded_years"],
-            Jsonb([]),
-            f"Top10评分 {score:.2f}",
+            Jsonb(row.get("top_holdings") or []),
+            row.get("concentration_label") or f"Top10评分 {score:.2f}",
             note,
             batch_id,
             DATA_VERSION,
@@ -328,13 +520,27 @@ def _upsert_fund_daily_metrics(cur, trade_date: date, batch_id: str, row: dict[s
 
 
 def _candidate_rows(
-    market_records: list[dict[str, Any]], profile: IndustryProfile
+    market_records: list[dict[str, Any]],
+    profile: IndustryProfile,
+    provider: ProProvider | None = None,
+    exposure_cache: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[tuple[float, dict[str, Any]]], int]:
     rows = []
+    cheap_rows = []
     for row in market_records:
         score = _match_candidate_score(row, profile)
         if score > 0:
-            rows.append((score, row))
+            cheap_rows.append((score, row))
+    cheap_rows.sort(key=lambda item: item[0], reverse=True)
+
+    if profile.industry_id == "cpo-optical-communication" and provider is not None:
+        for _, row in cheap_rows[:CPO_PROXY_CANDIDATE_CAP]:
+            score = _cpo_proxy_score(row, provider, exposure_cache if exposure_cache is not None else {})
+            if score > 0:
+                rows.append((score, row))
+    else:
+        rows = cheap_rows
+
     rows.sort(key=lambda item: item[0], reverse=True)
     return rows[:MAX_CANDIDATES_PER_INDUSTRY], len(rows)
 
@@ -357,10 +563,11 @@ def refresh_industry_top_funds(trade_date: date) -> dict[str, Any]:
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             existing_fund_ids = _load_existing_fund_ids(cur)
+            cpo_exposure_cache: dict[str, dict[str, Any]] = {}
             for profile in INDUSTRY_PROFILES:
                 ranked: list[dict[str, Any]] = []
                 failures: list[dict[str, str]] = []
-                candidates, matched_count = _candidate_rows(market_records, profile)
+                candidates, matched_count = _candidate_rows(market_records, profile, provider, cpo_exposure_cache)
                 print(
                     f"[industry_top10] industry={profile.industry_id} matched={matched_count} selected={len(candidates)}",
                     flush=True,
@@ -405,6 +612,7 @@ def refresh_industry_top_funds(trade_date: date) -> dict[str, Any]:
                             "master": master,
                             "daily": daily,
                             "missingMetrics": missing_metrics,
+                            "proxyEvidence": cpo_exposure_cache.get(code) if profile.industry_id == "cpo-optical-communication" else None,
                         }
                     )
 
@@ -417,6 +625,12 @@ def refresh_industry_top_funds(trade_date: date) -> dict[str, Any]:
                 for rank, result in enumerate(top_items, start=1):
                     master = result["master"]
                     daily = result["daily"]
+                    if daily.get("aum") is None:
+                        cached_aum = _cached_aum_for_fund(cur, str(master["fund_id"]), trade_date)
+                        if cached_aum is not None:
+                            daily["aum"] = cached_aum
+                            if "aum" in result["missingMetrics"]:
+                                result["missingMetrics"].remove("aum")
                     if daily.get("aum") is None and daily.get("latest_nav") is not None:
                         try:
                             daily["aum"] = provider.get_latest_fund_share_aum(
@@ -452,6 +666,15 @@ def refresh_industry_top_funds(trade_date: date) -> dict[str, Any]:
                             )
                     _upsert_fund_master(cur, master)
                     _upsert_industry_mapping(cur, profile.industry_id, str(master["fund_id"]), rank)
+                    if profile.industry_id == "cpo-optical-communication":
+                        evidence = result.get("proxyEvidence") or {}
+                        matched = evidence.get("matched") or []
+                        daily["top_holdings"] = [item.get("stockName") or item.get("stockCode") for item in matched]
+                        daily["concentration_label"] = (
+                            f"光通信链持仓约 {float(evidence.get('ratio') or 0):.1f}%"
+                            if evidence.get("ratio") is not None
+                            else "光通信链持仓待核验"
+                        )
                     _upsert_fund_daily_metrics(cur, trade_date, batch_id, daily, result["score"], result["components"])
 
                 report["industries"].append(
@@ -473,6 +696,7 @@ def refresh_industry_top_funds(trade_date: date) -> dict[str, Any]:
                                 "score": item["score"],
                                 "signal": item["signal"],
                                 "missingMetrics": item["missingMetrics"],
+                                "proxyEvidence": item.get("proxyEvidence"),
                             }
                             for index, item in enumerate(top_items, start=1)
                         ],

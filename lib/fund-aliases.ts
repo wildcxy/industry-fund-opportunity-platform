@@ -6,13 +6,25 @@ export type KnownFundAlias = {
   keywords: string[];
 };
 
+export type ScreenshotFundAlias = {
+  code?: string;
+  displayName: string;
+  keywords: string[];
+};
+
 function normalizeName(value: string) {
   return value
     .replace(/\s+/g, "")
     .replace(/（/g, "(")
     .replace(/）/g, ")")
+    .replace(/[“”"．.]+/g, "")
     .replace(/发起式/g, "")
     .replace(/人民币/g, "")
+    .replace(/QD[围回囗]C?/gi, "QDII)C")
+    .replace(/Å\*接/g, "联接")
+    .replace(/冫比口/g, "混合")
+    .replace(/九匕/g, "混合")
+    .replace(/晶国/g, "富国")
     .toLowerCase();
 }
 
@@ -117,6 +129,61 @@ export const knownPortfolioFundAliases: KnownFundAlias[] = [
   }
 ];
 
+const screenshotFundAliases: ScreenshotFundAlias[] = [
+  {
+    displayName: "银华海外数字经济量化选股混合C",
+    keywords: ["银华海外数字经济量化选股混", "银华海外数字经济量化选股混合", "银华海外数字经济"]
+  },
+  {
+    displayName: "广发半导体材料设备主题ETF联接C",
+    keywords: ["广发半导体材料设备主题ETF", "广发半导体材料设备主题", "广发半导体材料设备"]
+  },
+  {
+    displayName: "信澳业绩驱动混合C",
+    keywords: ["信澳业绩驱动混", "信澳业绩驱动混合", "信澳业绩驱动"]
+  },
+  {
+    displayName: "广发远见智选混合C",
+    keywords: ["广发远见智选混", "广发远见智选混合", "广发远见智选"]
+  },
+  {
+    displayName: "长城半导体产业混合C",
+    keywords: ["长城半导体产业混合C", "长城半导体产业冫比口C", "长城半导体产业"]
+  },
+  {
+    displayName: "招商中证有色金属矿业主题ETF联接C",
+    keywords: ["招商中证有色金属矿业主题ET", "招商中证有色金属矿业主题ETF", "招商中证有色金属矿业"]
+  },
+  {
+    displayName: "平安科技精选混合C",
+    keywords: ["平安科技精选混合C", "平安科技精选九匕", "平安科技精选"]
+  },
+  {
+    displayName: "广发中证光伏产业指数C",
+    keywords: ["广发中证光伏产业指数c", "广发中证光伏产业指数"]
+  },
+  {
+    displayName: "招商上证科创板芯片设计主题ETF联接C",
+    keywords: ["招商上证科创板芯片设计主题", "招商上证科创板芯片"]
+  },
+  {
+    displayName: "平安中证卫星产业指数C",
+    keywords: ["平安中证卫星产业指数c", "平安中证卫星产业指数"]
+  },
+  {
+    displayName: "广发新兴成长灵活配置混合C",
+    keywords: ["广发新兴成长灵活配置混合C", "广发新兴成长灵活配置"]
+  },
+  {
+    displayName: "富国高端制造行业股票C",
+    keywords: ["富国高端制造行业股票C", "晶国高端制造行业股票C", "富国高端制造"]
+  },
+  {
+    displayName: "东方阿尔法科技智选混合C",
+    keywords: ["东方阿尔法科技智选混合c", "东方阿尔法科技智选"]
+  }
+];
+
 export function findKnownFundAlias(nameOrCode: string | undefined | null) {
   if (!nameOrCode) return undefined;
   const normalized = normalizeName(nameOrCode);
@@ -128,4 +195,18 @@ export function findKnownFundAlias(nameOrCode: string | undefined | null) {
       return normalized.includes(normalizedKeyword) || normalizedKeyword.includes(normalized);
     });
   });
+}
+
+export function findScreenshotFundAlias(nameOrCode: string | undefined | null): ScreenshotFundAlias | KnownFundAlias | undefined {
+  if (!nameOrCode) return undefined;
+  const known = findKnownFundAlias(nameOrCode);
+  if (known) return known;
+
+  const normalized = normalizeName(nameOrCode);
+  return screenshotFundAliases.find((alias) =>
+    [alias.displayName, ...alias.keywords].some((keyword) => {
+      const normalizedKeyword = normalizeName(keyword);
+      return normalized.includes(normalizedKeyword) || normalizedKeyword.includes(normalized);
+    })
+  );
 }

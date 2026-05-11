@@ -1,12 +1,19 @@
 "use client";
 
-import { ChangeEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
 import { findKnownFundAlias } from "@/lib/fund-aliases";
-import { readJsonArray, STORAGE_KEYS, writeJsonArray } from "@/lib/storage";
-import { FundListItem, FundSearchResult, PortfolioPosition } from "@/types";
+import {
+  portfolioValuationKey,
+  readJsonArray,
+  readPortfolioValuationSnapshotMap,
+  STORAGE_KEYS,
+  writeJsonArray,
+  writePortfolioValuationSnapshotMap
+} from "@/lib/storage";
+import { FundListItem, FundSearchResult, PortfolioPosition, PortfolioValuationSnapshot, PortfolioValuationStatus } from "@/types";
 
 type DraftPosition = {
   fundCode: string;
@@ -20,10 +27,13 @@ type DraftPosition = {
 
 type SnapshotDraft = {
   fundName: string;
-  marketValue: number;
-  dayProfit: number;
-  holdingProfit: number;
-  holdingReturn: number;
+  marketValue: number | null;
+  dayProfit: number | null;
+  holdingProfit: number | null;
+  holdingReturn: number | null;
+  sourceImageName?: string;
+  confidence?: "high" | "medium" | "low";
+  warning?: string;
 };
 
 type PositionView = {
@@ -37,8 +47,18 @@ type PositionView = {
   totalProfit?: number | null;
   dayReturn?: number | null;
   totalReturn?: number | null;
+  valuationSnapshot?: PortfolioValuationSnapshot;
   dataMode: "nav" | "snapshot";
 };
+
+type RefreshVisibleResult = {
+  fundCode?: string;
+  status?: string;
+  message?: string;
+};
+
+const PORTFOLIO_VALUATION_REFRESH_MS = 60_000;
+const PORTFOLIO_VALUATION_FRESH_MS = 90_000;
 
 const emptyDraft: DraftPosition = {
   fundCode: "",
@@ -89,13 +109,25 @@ function mergePositionsByIdentity(positions: PortfolioPosition[]) {
   const merged = new Map<string, PortfolioPosition>();
   positions.forEach((position) => {
     const enriched = enrichPositionWithKnownAlias(position);
-    const key = enriched.fundCode ? `code-${enriched.fundCode}` : enriched.positionId;
+    const key = positionIdentityKey(enriched);
     merged.set(key, {
       ...enriched,
       positionId: enriched.fundCode ? `code-${enriched.fundCode}` : enriched.positionId
     });
   });
   return Array.from(merged.values()).sort((left, right) => (right.updatedAt ?? right.createdAt).localeCompare(left.updatedAt ?? left.createdAt));
+}
+
+function positionIdentityKey(position: Pick<PortfolioPosition, "positionId" | "fundCode">) {
+  return position.fundCode ? `code-${position.fundCode}` : position.positionId;
+}
+
+function validNumber(value?: number | null) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function finiteNumberOrNull(value?: number | null) {
+  return validNumber(value) ? value : null;
 }
 
 function enrichPositionWithKnownAlias(position: PortfolioPosition): PortfolioPosition {
@@ -161,6 +193,48 @@ function formatPercent(value?: number | null) {
   return `${sign}${value.toFixed(2)}%`;
 }
 
+function formatTime(value?: string | null) {
+  if (!value) return "--";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+}
+
+function valuationStatusLabel(status?: PortfolioValuationStatus) {
+  switch (status) {
+    case "fresh":
+      return "估值有效";
+    case "refreshing":
+      return "刷新中";
+    case "stale":
+      return "估值过期";
+    case "failed":
+      return "刷新失败";
+    case "unavailable":
+      return "暂无估值";
+    case "delayed":
+      return "延迟估值";
+    default:
+      return "待估值";
+  }
+}
+
+function valuationStatusTone(status?: PortfolioValuationStatus) {
+  switch (status) {
+    case "fresh":
+      return "text-pine";
+    case "delayed":
+      return "text-amber-700";
+    case "refreshing":
+      return "text-sky-700";
+    case "stale":
+    case "failed":
+      return "text-rose-700";
+    default:
+      return "text-ink/55";
+  }
+}
+
 function toNumber(value: string) {
   const next = normalizeMoney(value);
   return Number.isFinite(next) ? next : 0;
@@ -175,7 +249,7 @@ function parseSnapshotRows(raw: string): SnapshotDraft[] {
     .split(/\n+/)
     .map((line) => line.trim())
     .filter(Boolean)
-    .map((line) => {
+    .map((line): SnapshotDraft | null => {
       const match = line.match(/^(.+?)\s+([0-9,]+\.\d{2})\s+([+-]?[0-9,]+\.\d{2})\s+([+-]?[0-9,]+\.\d{2})\s+([+-]?[0-9,]+\.\d{1,2})%?$/);
       if (!match) return null;
       return {
@@ -187,6 +261,17 @@ function parseSnapshotRows(raw: string): SnapshotDraft[] {
       };
     })
     .filter((item): item is SnapshotDraft => Boolean(item));
+}
+
+function formatDraftLine(item: SnapshotDraft) {
+  const values = [
+    item.fundName,
+    item.marketValue?.toFixed(2) ?? "",
+    item.dayProfit?.toFixed(2) ?? "",
+    item.holdingProfit?.toFixed(2) ?? "",
+    item.holdingReturn !== null && item.holdingReturn !== undefined ? `${item.holdingReturn.toFixed(2)}%` : ""
+  ];
+  return values.join(" ").trim();
 }
 
 function matchFundByName(funds: FundListItem[], name: string) {
@@ -203,7 +288,85 @@ function isPortfolioGeneratedWatchId(id: string) {
   return /^user-\d{6}$/.test(id) || /^code-\d{6}$/.test(id);
 }
 
-function buildPositionView(position: PortfolioPosition, fund?: FundListItem): PositionView {
+function buildPortfolioValuationSnapshot(
+  position: PortfolioPosition,
+  fund: FundListItem | undefined,
+  previous?: PortfolioValuationSnapshot,
+  options: { refreshFailed?: boolean; errorMessage?: string } = {}
+): PortfolioValuationSnapshot {
+  const now = new Date().toISOString();
+  const key = portfolioValuationKey(position);
+  const previousAgeMs = previous ? Date.now() - new Date(previous.valuationUpdatedAt).getTime() : Number.POSITIVE_INFINITY;
+  const previousFresh = Number.isFinite(previousAgeMs) && previousAgeMs <= PORTFOLIO_VALUATION_FRESH_MS;
+  const latestNav = finiteNumberOrNull(fund?.latestNav);
+  const isQdii = Boolean((fund?.fundType ?? position.fundName).toUpperCase().includes("QDII"));
+  const units = finiteNumberOrNull(position.units);
+  const costNav = finiteNumberOrNull(position.costNav);
+  const holdingCostAmount = typeof units === "number" && typeof costNav === "number" ? units * costNav : previous?.holdingCostAmount ?? null;
+  const manualValue = finiteNumberOrNull(position.marketValueSnapshot);
+  const navEstimatedValue = typeof units === "number" && typeof latestNav === "number" ? units * latestNav : null;
+  const currentEstimatedValue = navEstimatedValue ?? manualValue ?? previous?.currentEstimatedValue ?? null;
+  const previousNav = finiteNumberOrNull(fund?.previousNav);
+  const dailyReturn = finiteNumberOrNull(fund?.return1d) ?? null;
+  const navDailyProfit =
+    typeof units === "number" && typeof latestNav === "number" && typeof previousNav === "number"
+      ? units * (latestNav - previousNav)
+      : null;
+  const snapshotDailyProfit =
+    currentEstimatedValue !== null && dailyReturn !== null && dailyReturn > -99.9
+      ? currentEstimatedValue * (dailyReturn / 100) / (1 + dailyReturn / 100)
+      : null;
+  const estimatedProfit =
+    navDailyProfit ?? snapshotDailyProfit ?? position.dayProfitSnapshot ?? previous?.estimatedProfit ?? null;
+  const estimatedProfitPercent = dailyReturn ?? previous?.estimatedProfitPercent ?? null;
+  const hasFreshNavValuation = navEstimatedValue !== null;
+  const hasSnapshotValue = manualValue !== null || previous?.currentEstimatedValue !== null;
+  const valuationStatus: PortfolioValuationStatus = options.refreshFailed
+    ? previous?.valuationStatus === "fresh" && previousFresh
+      ? "stale"
+      : "failed"
+    : hasFreshNavValuation
+      ? isQdii
+        ? "delayed"
+        : "fresh"
+      : hasSnapshotValue
+        ? "stale"
+        : "unavailable";
+  const valuationUpdatedAt = options.refreshFailed && previous?.valuationUpdatedAt ? previous.valuationUpdatedAt : now;
+
+  return {
+    snapshotId: `portfolio-valuation-${key}-${valuationUpdatedAt}`,
+    fundId: fund?.fundId ?? position.positionId,
+    fundCode: position.fundCode ?? fund?.fundCode,
+    fundName: fund?.fundName ?? position.fundName,
+    holdingId: position.positionId,
+    positionAmount: manualValue,
+    positionShare: units,
+    holdingCostAmount,
+    costNav,
+    latestEstimatedNav: latestNav,
+    latestEstimatedPrice: latestNav,
+    valuationDate: fund?.latestNavDate ?? fund?.metricTradeDate ?? fund?.metricUpdatedAt ?? position.updatedAt ?? position.createdAt,
+    currentEstimatedValue,
+    estimatedProfit,
+    estimatedProfitPercent,
+    valuationUpdatedAt,
+    valuationStatus,
+    dataSource: hasFreshNavValuation ? "backend_cache" : hasSnapshotValue ? "manual_import" : "unavailable",
+    delayReason: isQdii ? "QDII 或海外市场净值披露存在延迟，以最新可用日期展示。" : undefined,
+    staleReason: options.refreshFailed
+      ? "本次刷新失败，保留上一条估值快照作为过期参考。"
+      : hasFreshNavValuation
+        ? undefined
+        : hasSnapshotValue
+          ? "当前仅有持仓截图或手动金额，等待净值刷新。"
+          : "缺少份额、净值或持仓金额。",
+    errorMessage: options.errorMessage,
+    isRealtime: false
+  };
+}
+
+function buildPositionView(position: PortfolioPosition, fund?: FundListItem, valuationSnapshot?: PortfolioValuationSnapshot): PositionView {
   const latestNav = fund?.latestNav ?? null;
   const previousNav = fund?.previousNav ?? null;
   const hasNavPosition = Boolean(position.units && position.costNav);
@@ -227,6 +390,7 @@ function buildPositionView(position: PortfolioPosition, fund?: FundListItem): Po
       totalProfit,
       dayReturn: fund?.return1d ?? (latestNav && previousNav ? ((latestNav - previousNav) / previousNav) * 100 : null),
       totalReturn: totalProfit !== null && costValue > 0 ? (totalProfit / costValue) * 100 : position.holdingReturnSnapshot ?? null,
+      valuationSnapshot,
       dataMode: "nav"
     };
   }
@@ -250,6 +414,7 @@ function buildPositionView(position: PortfolioPosition, fund?: FundListItem): Po
     totalProfit,
     dayReturn: fund?.return1d ?? null,
     totalReturn: position.holdingReturnSnapshot ?? null,
+    valuationSnapshot,
     dataMode: "snapshot"
   };
 }
@@ -278,28 +443,151 @@ function getPortfolioSignals(item: PositionView) {
 
 export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
   const router = useRouter();
+  const screenshotInputRef = useRef<HTMLInputElement | null>(null);
   const [positions, setPositions] = useState<PortfolioPosition[]>([]);
   const [draft, setDraft] = useState<DraftPosition>(emptyDraft);
   const [message, setMessage] = useState("");
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
   const [uploadedNames, setUploadedNames] = useState<string[]>([]);
   const [snapshotText, setSnapshotText] = useState("");
   const [snapshotDrafts, setSnapshotDrafts] = useState<SnapshotDraft[]>([]);
+  const [screenshotRecognitionMessage, setScreenshotRecognitionMessage] = useState("");
+  const [isRecognizingScreenshots, setIsRecognizingScreenshots] = useState(false);
   const [isCollectingPortfolio, setIsCollectingPortfolio] = useState(false);
+  const [marketValueEdits, setMarketValueEdits] = useState<Record<string, string>>({});
+  const [valuationSnapshots, setValuationSnapshots] = useState<Record<string, PortfolioValuationSnapshot>>({});
+  const [valuationRefreshTime, setValuationRefreshTime] = useState<string | null>(null);
+  const [isValuationRefreshing, setIsValuationRefreshing] = useState(false);
 
   const fundByCode = useMemo(() => new Map(funds.map((fund) => [fund.fundCode, fund])), [funds]);
   const selectedFund = draft.fundCode ? fundByCode.get(draft.fundCode.trim()) : matchFundByName(funds, draft.fundName);
   const positionViews = useMemo(
     () =>
       positions
-        .map((position) => buildPositionView(position, position.fundCode ? fundByCode.get(position.fundCode) : matchFundByName(funds, position.fundName)))
+        .map((position) =>
+          buildPositionView(
+            position,
+            position.fundCode ? fundByCode.get(position.fundCode) : matchFundByName(funds, position.fundName),
+            valuationSnapshots[portfolioValuationKey(position)]
+          )
+        )
         .sort((left, right) => (right.marketValue ?? 0) - (left.marketValue ?? 0)),
-    [fundByCode, funds, positions]
+    [fundByCode, funds, positions, valuationSnapshots]
   );
+
+  function refreshPortfolioValuations(sourcePositions = positions, options: { silent?: boolean; refreshFailed?: boolean; errorMessage?: string } = {}) {
+    if (!sourcePositions.length) {
+      setValuationSnapshots({});
+      writePortfolioValuationSnapshotMap({});
+      setValuationRefreshTime(null);
+      return;
+    }
+
+    setIsValuationRefreshing(true);
+    setValuationSnapshots((current) => {
+      const next: Record<string, PortfolioValuationSnapshot> = { ...current };
+      sourcePositions.forEach((position) => {
+        const fund = position.fundCode ? fundByCode.get(position.fundCode) : matchFundByName(funds, position.fundName);
+        const key = portfolioValuationKey(position);
+        next[key] = buildPortfolioValuationSnapshot(position, fund, current[key], {
+          refreshFailed: options.refreshFailed,
+          errorMessage: options.errorMessage
+        });
+      });
+      const activeKeys = new Set(positions.map(portfolioValuationKey));
+      Object.keys(next).forEach((key) => {
+        if (!activeKeys.has(key)) delete next[key];
+      });
+      writePortfolioValuationSnapshotMap(next);
+      return next;
+    });
+    const now = new Date().toISOString();
+    setValuationRefreshTime(now);
+    if (!options.silent) {
+      setMessage(`已刷新 ${sourcePositions.length} 只持仓基金估值；该估值仅用于持仓监控。`);
+    }
+    window.setTimeout(() => {
+      setIsValuationRefreshing(false);
+    }, 400);
+  }
+
+  async function refreshHeldFundSnapshots(sourcePositions = positions, options: { silent?: boolean } = {}) {
+    const fundCodes = Array.from(new Set(sourcePositions.map((position) => position.fundCode).filter(Boolean))) as string[];
+    if (!fundCodes.length) {
+      refreshPortfolioValuations(sourcePositions, options);
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/funds/refresh-visible", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ fundCodes })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.message ?? payload.detail ?? "持仓基金估值刷新失败");
+      }
+      const results = Array.isArray(payload.results) ? (payload.results as RefreshVisibleResult[]) : [];
+      const failedCodes = new Set(results.filter((result) => result.status === "failed" && result.fundCode).map((result) => result.fundCode as string));
+      const failedMessages = new Map(
+        results
+          .filter((result) => result.status === "failed" && result.fundCode)
+          .map((result) => [result.fundCode as string, result.message ?? "该持仓基金估值刷新失败。"])
+      );
+      const successfulPositions = sourcePositions.filter((position) => !position.fundCode || !failedCodes.has(position.fundCode));
+      const failedPositions = sourcePositions.filter((position) => position.fundCode && failedCodes.has(position.fundCode));
+      if (successfulPositions.length) {
+        refreshPortfolioValuations(successfulPositions, { silent: true });
+      }
+      failedPositions.forEach((position) => {
+        refreshPortfolioValuations([position], {
+          silent: true,
+          refreshFailed: true,
+          errorMessage: failedMessages.get(position.fundCode ?? "") ?? "该持仓基金估值刷新失败。"
+        });
+      });
+      router.refresh();
+      if (!options.silent) {
+        setMessage(`已请求刷新 ${fundCodes.length} 只已持仓基金估值；成功 ${payload.successCount ?? 0} 只，失败 ${payload.failedCount ?? 0} 只。`);
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "持仓基金估值刷新失败";
+      refreshPortfolioValuations(sourcePositions, { silent: true, refreshFailed: true, errorMessage });
+      if (!options.silent) {
+        setMessage(`${errorMessage}；已保留本地估值快照。`);
+      }
+    }
+  }
 
   useEffect(() => {
     syncWatchlistFromPositions(positions);
   }, [positions, fundByCode]);
+
+  useEffect(() => {
+    setValuationSnapshots(readPortfolioValuationSnapshotMap());
+  }, []);
+
+  useEffect(() => {
+    if (!positions.length) {
+      setValuationSnapshots({});
+      writePortfolioValuationSnapshotMap({});
+      setValuationRefreshTime(null);
+      return;
+    }
+
+    refreshPortfolioValuations(positions, { silent: true });
+    const intervalId = window.setInterval(() => {
+      void refreshHeldFundSnapshots(positions, { silent: true });
+    }, PORTFOLIO_VALUATION_REFRESH_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [positions, fundByCode, funds]);
 
   useEffect(() => {
     let cancelled = false;
@@ -335,14 +623,40 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
   const summary = useMemo(() => {
     return positionViews.reduce(
       (acc, item) => {
-        acc.costValue += item.costValue ?? 0;
-        acc.marketValue += item.marketValue ?? 0;
-        acc.dayProfit += item.dayProfit ?? 0;
-        acc.totalProfit += item.totalProfit ?? 0;
+        if (item.costValue === null || item.costValue === undefined) {
+          acc.costValueUnknownCount += 1;
+        } else {
+          acc.costValue += item.costValue;
+        }
+        if (item.marketValue === null || item.marketValue === undefined) {
+          acc.marketValueUnknownCount += 1;
+        } else {
+          acc.marketValue += item.marketValue;
+        }
+        if (item.dayProfit === null || item.dayProfit === undefined) {
+          acc.dayProfitUnknownCount += 1;
+        } else {
+          acc.dayProfit += item.dayProfit;
+        }
+        if (item.totalProfit === null || item.totalProfit === undefined) {
+          acc.totalProfitUnknownCount += 1;
+        } else {
+          acc.totalProfit += item.totalProfit;
+        }
         if (item.latestNav || item.marketValue) acc.readyCount += 1;
         return acc;
       },
-      { costValue: 0, marketValue: 0, dayProfit: 0, totalProfit: 0, readyCount: 0 }
+      {
+        costValue: 0,
+        marketValue: 0,
+        dayProfit: 0,
+        totalProfit: 0,
+        readyCount: 0,
+        costValueUnknownCount: 0,
+        marketValueUnknownCount: 0,
+        dayProfitUnknownCount: 0,
+        totalProfitUnknownCount: 0
+      }
     );
   }, [positionViews]);
 
@@ -383,6 +697,21 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
       });
   }
 
+  async function refreshPortfolioDecision() {
+    const response = await fetch("/api/portfolio/refresh", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({})
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.message ?? payload.detail ?? "组合策略刷新失败");
+    }
+    return payload;
+  }
+
   function savePosition() {
     const fundCode = draft.fundCode.trim();
     const fund = fundCode ? fundByCode.get(fundCode) : matchFundByName(funds, draft.fundName);
@@ -420,14 +749,59 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
     };
     persist([nextPosition, ...positions.filter((item) => item.positionId !== positionId)]);
     setDraft(emptyDraft);
-    setMessage("已更新本地持仓。截图金额类持仓会先按资产快照展示，匹配到基金代码后可继续增强净值和收益计算。");
+    setMessage("已保存持仓，正在自动拉取这只基金的最新盘后数据。");
+    window.setTimeout(() => {
+      void collectPortfolioData([nextPosition]);
+    }, 0);
+  }
+
+  function updateMarketValueEdit(positionId: string, value: string) {
+    setMarketValueEdits((current) => ({ ...current, [positionId]: value }));
+  }
+
+  function savePositionMarketValue(position: PortfolioPosition, currentMarketValue?: number | null) {
+    const raw = marketValueEdits[position.positionId] ?? String(currentMarketValue ?? position.marketValueSnapshot ?? "");
+    const marketValue = toNumber(raw);
+    if (marketValue <= 0) {
+      setMessage("请填写有效的持仓金额。");
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const nextPosition: PortfolioPosition = {
+      ...position,
+      marketValueSnapshot: marketValue,
+      holdingProfitSnapshot: position.holdingProfitSnapshot,
+      source: position.source ?? "manual_snapshot",
+      updatedAt: now
+    };
+
+    setMarketValueEdits((current) => {
+      const next = { ...current };
+      delete next[position.positionId];
+      return next;
+    });
+    persist([nextPosition, ...positions.filter((item) => positionIdentityKey(item) !== positionIdentityKey(nextPosition))]);
+    setMessage("已更新这只基金的持仓金额，正在刷新对应基金盘后数据。");
+    window.setTimeout(() => {
+      void collectPortfolioData([nextPosition]);
+    }, 0);
   }
 
   function handleImageUpload(event: ChangeEvent<HTMLInputElement>) {
-    const names = Array.from(event.target.files ?? []).map((file) => file.name);
+    const files = Array.from(event.target.files ?? []);
+    const names = files.map((file) => file.name);
+    setUploadedFiles(files);
     setUploadedNames(names);
+    setSnapshotDrafts([]);
+    setSnapshotText("");
     if (names.length) {
-      setMessage("截图已加入导入队列。当前本地版先做上传与确认流程，OCR 自动识别会在接入视觉识别服务后替换人工确认。");
+      const nextMessage = `已选择 ${names.length} 张截图。点击“识别本次截图”生成导入草稿；新上传已清空上一批草稿。`;
+      setScreenshotRecognitionMessage(nextMessage);
+      setMessage(nextMessage);
+    } else {
+      setScreenshotRecognitionMessage("");
+      setMessage("");
     }
   }
 
@@ -437,10 +811,74 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
     setMessage(rows.length ? `已解析 ${rows.length} 条截图持仓，请确认后导入。` : "暂未解析到持仓。建议格式：基金名称 持有金额 昨日收益 持有收益 持有收益率");
   }
 
-  function loadCurrentScreenshotExample() {
+  async function recognizeCurrentScreenshots() {
+    const currentFiles = uploadedFiles.length ? uploadedFiles : Array.from(screenshotInputRef.current?.files ?? []);
+
+    if (!currentFiles.length) {
+      const nextMessage = "请先选择本次要识别的持仓截图。";
+      setScreenshotRecognitionMessage(nextMessage);
+      setMessage(nextMessage);
+      return;
+    }
+
+    setIsRecognizingScreenshots(true);
+    const recognizingMessage = `正在识别 ${currentFiles.length} 张截图，请稍等。`;
+    setScreenshotRecognitionMessage(recognizingMessage);
+    setMessage(recognizingMessage);
+
+    try {
+      const formData = new FormData();
+      currentFiles.forEach((file) => {
+        formData.append("images", file, file.name);
+      });
+
+      const response = await fetch("/api/portfolio/screenshot-drafts", {
+        method: "POST",
+        body: formData
+      });
+      const payload = await response.json().catch(() => ({}));
+      const drafts = Array.isArray(payload.drafts) ? (payload.drafts as SnapshotDraft[]) : [];
+      const warnings = Array.isArray(payload.warnings) ? payload.warnings.filter(Boolean).join("；") : "";
+
+      if (payload.status === "config_missing") {
+        setSnapshotDrafts([]);
+        setSnapshotText("");
+        const nextMessage = warnings || "未配置视觉识别服务，无法识别本次截图。";
+        setScreenshotRecognitionMessage(nextMessage);
+        setMessage(nextMessage);
+        return;
+      }
+
+      if (!response.ok || payload.status !== "ok") {
+        setSnapshotDrafts([]);
+        const nextMessage = warnings || payload.message || "截图识别失败，请稍后重试或粘贴 OCR 文本后解析。";
+        setScreenshotRecognitionMessage(nextMessage);
+        setMessage(nextMessage);
+        return;
+      }
+
+      setSnapshotDrafts(drafts);
+      setSnapshotText(typeof payload.rawText === "string" && payload.rawText.trim() ? payload.rawText : drafts.map(formatDraftLine).join("\n"));
+      const nextMessage =
+        drafts.length
+          ? `已从本次 ${payload.imageCount ?? currentFiles.length} 张截图识别 ${drafts.length} 条持仓草稿，请校对后导入。${warnings ? `提示：${warnings}` : ""}`
+          : `本次截图未识别到持仓草稿。${warnings ? `提示：${warnings}` : ""}`;
+      setScreenshotRecognitionMessage(nextMessage);
+      setMessage(nextMessage);
+    } catch (error) {
+      setSnapshotDrafts([]);
+      const nextMessage = error instanceof Error ? error.message : "截图识别失败，请稍后重试。";
+      setScreenshotRecognitionMessage(nextMessage);
+      setMessage(nextMessage);
+    } finally {
+      setIsRecognizingScreenshots(false);
+    }
+  }
+
+  function loadExampleScreenshotDrafts() {
     setSnapshotDrafts(alipayExampleRows);
-    setSnapshotText(alipayExampleRows.map((item) => `${item.fundName} ${item.marketValue.toFixed(2)} ${item.dayProfit.toFixed(2)} ${item.holdingProfit.toFixed(2)} ${item.holdingReturn.toFixed(2)}%`).join("\n"));
-    setMessage("已根据你这次上传的 3 张支付宝截图生成导入草稿，请确认后导入。");
+    setSnapshotText(alipayExampleRows.map(formatDraftLine).join("\n"));
+    setMessage("已载入示例草稿，仅用于演示格式；不会代表本次上传截图的识别结果。");
   }
 
   function importSnapshotDrafts() {
@@ -459,10 +897,10 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
         positionId: fundCode ? `code-${fundCode}` : `name-${slugifyName(item.fundName)}`,
         fundCode,
         fundName,
-        marketValueSnapshot: item.marketValue,
-        dayProfitSnapshot: item.dayProfit,
-        holdingProfitSnapshot: item.holdingProfit,
-        holdingReturnSnapshot: item.holdingReturn,
+        marketValueSnapshot: item.marketValue ?? undefined,
+        dayProfitSnapshot: item.dayProfit ?? undefined,
+        holdingProfitSnapshot: item.holdingProfit ?? undefined,
+        holdingReturnSnapshot: item.holdingReturn ?? undefined,
         source: "alipay_screenshot",
         createdAt: now,
         updatedAt: now
@@ -471,6 +909,10 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
     const nextIds = new Set(nextRows.map((item) => item.positionId));
     const nextPositions = [...nextRows, ...positions.filter((item) => !nextIds.has(item.positionId))];
     persist(nextPositions);
+    setUploadedFiles([]);
+    setUploadedNames([]);
+    setSnapshotDrafts([]);
+    setSnapshotText("");
     setMessage(`已导入 ${nextRows.length} 条支付宝截图持仓，正在自动匹配基金代码并拉取真实数据。`);
     window.setTimeout(() => {
       void collectPortfolioData(nextPositions);
@@ -568,9 +1010,18 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
       }
     }
 
-    const deduped = new Map<string, PortfolioPosition>();
-    updated.forEach((item) => deduped.set(item.positionId, item));
-    persist(Array.from(deduped.values()));
+    const sourceKeys = new Set(sourcePositions.map(positionIdentityKey));
+    const updatedKeys = new Set([...updated.map(positionIdentityKey), ...sourceKeys]);
+    const mergedPositions = [
+      ...updated,
+      ...positions.filter((item) => !updatedKeys.has(positionIdentityKey(item)))
+    ];
+    persist(mergedPositions);
+    try {
+      await refreshPortfolioDecision();
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : "组合策略刷新失败");
+    }
     setIsCollectingPortfolio(false);
     router.refresh();
     setMessage(
@@ -593,17 +1044,30 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
     }, 600);
   }
 
+  function refreshHeldValuations() {
+    void refreshHeldFundSnapshots(positions);
+  }
+
   return (
     <div className="space-y-8">
       <section className="panel p-6">
         <div className="grid gap-4 md:grid-cols-4">
           <SummaryCard label="持仓基金" value={`${positions.length} 只`} />
           <SummaryCard label="已匹配估值" value={`${summary.readyCount} 只`} />
-          <SummaryCard label="当前市值" value={formatPlainMoney(summary.marketValue)} />
-          <SummaryCard label="昨日盈亏" value={formatMoney(summary.dayProfit)} tone={summary.dayProfit >= 0 ? "positive" : "negative"} />
+          <SummaryCard
+            label="当前市值"
+            value={formatPlainMoney(summary.marketValue)}
+            note={summary.marketValueUnknownCount ? `${summary.marketValueUnknownCount} 只待补` : undefined}
+          />
+          <SummaryCard
+            label="今日盈亏"
+            value={formatMoney(summary.dayProfit)}
+            tone={summary.dayProfit >= 0 ? "positive" : "negative"}
+            note={summary.dayProfitUnknownCount ? `${summary.dayProfitUnknownCount} 只待补` : undefined}
+          />
         </div>
         <p className="mt-4 text-sm leading-7 text-ink/60">
-          本页支持“份额+成本净值”的手动录入，也支持“支付宝截图资产快照”导入。截图快照优先用于持仓资产画像，匹配到基金代码后再结合盘后净值做增强计算。
+          本页支持“份额+成本净值”的手动录入，也支持“支付宝截图资产快照”导入。保存持仓后会自动同步数据库并拉取对应基金的盘后最新数据；已有持仓可以在列表里直接修改持仓金额。
         </p>
         <div className="mt-4 flex flex-wrap gap-3">
           <button
@@ -617,34 +1081,54 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
           <button type="button" onClick={refreshQuotes} disabled={isRefreshing} className="rounded-full border border-ink/15 bg-white px-5 py-3 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-60">
             {isRefreshing ? "刷新中..." : "刷新页面快照"}
           </button>
+          <button type="button" onClick={refreshHeldValuations} disabled={isValuationRefreshing} className="rounded-full border border-ink/15 bg-white px-5 py-3 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-60">
+            {isValuationRefreshing ? "估值刷新中..." : "刷新持仓估值"}
+          </button>
           <Link href="/watchlist" className="rounded-full border border-ink/15 bg-white px-5 py-3 text-sm font-semibold">
             去我的观察
           </Link>
         </div>
+        <p className="mt-3 text-xs leading-6 text-ink/50">
+          盘中估算涨跌幅约每 1 分钟刷新一次，只覆盖已录入持仓基金；盘后展示今日涨幅，更新时间 {formatTime(valuationRefreshTime)}，不代表实时成交价格。
+        </p>
       </section>
 
       <section className="panel p-6">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-end">
           <label className="flex-1 rounded-2xl bg-mist/60 p-4 text-sm font-medium text-ink/80">
             <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.18em] text-pine/70">上传支付宝持仓截图</span>
-            <input type="file" accept="image/*" multiple onChange={handleImageUpload} className="w-full rounded-xl border border-ink/10 bg-white px-4 py-3" />
+            <input ref={screenshotInputRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple onChange={handleImageUpload} className="w-full rounded-xl border border-ink/10 bg-white px-4 py-3" />
             <p className="mt-3 text-xs leading-6 text-ink/55">
-              当前先落地上传、草稿确认和导入流程；真正 OCR 自动识别建议接入服务端视觉识别，避免把金额识别错后直接覆盖持仓。
+              上传后会调用服务端视觉识别生成草稿；导入前请先校对金额，系统不会保存原图。
             </p>
           </label>
           <div className="flex flex-wrap gap-2">
-            <button type="button" onClick={loadCurrentScreenshotExample} className="rounded-full bg-ink px-5 py-3 text-sm font-semibold text-white">
-              载入本次截图识别草稿
+            <button
+              type="button"
+              onClick={() => void recognizeCurrentScreenshots()}
+              disabled={isRecognizingScreenshots}
+              className="rounded-full bg-ink px-5 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isRecognizingScreenshots ? "识别中..." : "识别本次截图"}
             </button>
             <button type="button" onClick={importSnapshotDrafts} className="rounded-full border border-ink/15 bg-white px-5 py-3 text-sm font-semibold">
               确认导入草稿
             </button>
+            <button type="button" onClick={loadExampleScreenshotDrafts} className="rounded-full border border-ink/15 bg-white px-5 py-3 text-sm font-semibold text-ink/70">
+              载入示例草稿
+            </button>
           </div>
         </div>
 
+        {screenshotRecognitionMessage ? (
+          <p className="mt-4 rounded-xl bg-white p-3 text-sm leading-6 text-ink/65 ring-1 ring-ink/10">
+            {screenshotRecognitionMessage}
+          </p>
+        ) : null}
+
         {uploadedNames.length ? (
           <div className="mt-4 rounded-xl bg-white p-4 text-sm text-ink/65">
-            已选择截图：{uploadedNames.join("、")}
+            已选择 {uploadedNames.length} 张截图：{uploadedNames.join("、")}
           </div>
         ) : null}
 
@@ -669,13 +1153,13 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
                 snapshotDrafts.map((item) => (
                   <div key={item.fundName} className="flex items-center justify-between gap-3 rounded-lg bg-mist/60 px-3 py-2 text-sm">
                     <span className="font-medium">{item.fundName}</span>
-                    <span className={item.holdingProfit >= 0 ? "text-pine" : "text-rose-700"}>
+                    <span className={(item.holdingProfit ?? 0) >= 0 ? "text-pine" : "text-rose-700"}>
                       {formatPlainMoney(item.marketValue)} / {formatMoney(item.holdingProfit)}
                     </span>
                   </div>
                 ))
               ) : (
-                <p className="text-sm leading-7 text-ink/55">暂无草稿。可以先点击“载入本次截图识别草稿”，或粘贴 OCR 文本后解析。</p>
+                <p className="text-sm leading-7 text-ink/55">暂无草稿。可以先点击“识别本次截图”，或粘贴 OCR 文本后解析。</p>
               )}
             </div>
           </div>
@@ -738,6 +1222,9 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
           <button type="button" onClick={refreshQuotes} disabled={isRefreshing} className="rounded-full border border-ink/15 bg-white px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-60">
             {isRefreshing ? "刷新中..." : "刷新基金快照"}
           </button>
+          <button type="button" onClick={refreshHeldValuations} disabled={isValuationRefreshing} className="rounded-full border border-ink/15 bg-white px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-60">
+            {isValuationRefreshing ? "估值刷新中..." : "刷新持仓估值"}
+          </button>
           <button
             type="button"
             onClick={() => void collectPortfolioData()}
@@ -763,8 +1250,10 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
                 <tr>
                   <th className="px-5 py-4">基金</th>
                   <th className="px-5 py-4">资产 / 成本</th>
+                  <th className="px-5 py-4">今日涨幅</th>
+                  <th className="px-5 py-4">今日收益</th>
                   <th className="px-5 py-4">最新净值</th>
-                  <th className="px-5 py-4">昨日盈亏</th>
+                  <th className="px-5 py-4">今日盈亏</th>
                   <th className="px-5 py-4">累计盈亏</th>
                   <th className="px-5 py-4">数据模式</th>
                   <th className="px-5 py-4">动作</th>
@@ -793,6 +1282,40 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
                     <td className="px-5 py-4">
                       <p>{formatPlainMoney(item.marketValue)}</p>
                       <p className="mt-1 text-xs text-ink/55">估算成本 {formatPlainMoney(item.costValue)}</p>
+                      <div className="mt-3 flex min-w-[220px] items-center gap-2">
+                        <input
+                          value={marketValueEdits[item.position.positionId] ?? ""}
+                          onChange={(event) => updateMarketValueEdit(item.position.positionId, event.target.value)}
+                          inputMode="decimal"
+                          placeholder="修改持仓金额"
+                          className="w-32 rounded-xl border border-ink/10 bg-mist/50 px-3 py-2 text-xs outline-none"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => savePositionMarketValue(item.position, item.marketValue)}
+                          className="rounded-full bg-white px-3 py-2 text-xs font-semibold ring-1 ring-ink/10 hover:text-pine"
+                        >
+                          保存金额
+                        </button>
+                      </div>
+                    </td>
+                    <td className="px-5 py-4">
+                      <p className={`font-semibold ${(item.dayReturn ?? 0) >= 0 ? "text-pine" : "text-rose-700"}`}>
+                        {formatPercent(item.dayReturn)}
+                      </p>
+                      <p className={`mt-1 text-xs ${valuationStatusTone(item.valuationSnapshot?.valuationStatus)}`}>
+                        {valuationStatusLabel(item.valuationSnapshot?.valuationStatus)} · {formatTime(item.valuationSnapshot?.valuationUpdatedAt)}
+                      </p>
+                      {item.valuationSnapshot?.delayReason || item.valuationSnapshot?.staleReason ? (
+                        <p className="mt-1 max-w-[180px] text-xs leading-5 text-ink/45">{item.valuationSnapshot.delayReason ?? item.valuationSnapshot.staleReason}</p>
+                      ) : null}
+                      {item.valuationSnapshot?.errorMessage ? (
+                        <p className="mt-1 max-w-[180px] text-xs leading-5 text-rose-700">{item.valuationSnapshot.errorMessage}</p>
+                      ) : null}
+                    </td>
+                    <td className={`px-5 py-4 font-semibold ${(item.valuationSnapshot?.estimatedProfit ?? 0) >= 0 ? "text-pine" : "text-rose-700"}`}>
+                      {formatMoney(item.valuationSnapshot?.estimatedProfit)}
+                      <p className="mt-1 text-xs font-normal text-ink/55">{formatPercent(item.valuationSnapshot?.estimatedProfitPercent)}</p>
                     </td>
                     <td className="px-5 py-4">
                       <p>{formatNav(item.latestNav)}</p>
@@ -812,9 +1335,19 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
                       </span>
                     </td>
                     <td className="px-5 py-4">
-                      <button type="button" onClick={() => removePosition(item.position.positionId)} className="rounded-full border border-ink/15 bg-white px-4 py-2 text-xs font-semibold">
-                        移除
-                      </button>
+                      <div className="flex flex-col gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void collectPortfolioData([item.position])}
+                          disabled={isCollectingPortfolio}
+                          className="rounded-full bg-pine px-4 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          刷新这只
+                        </button>
+                        <button type="button" onClick={() => removePosition(item.position.positionId)} className="rounded-full border border-ink/15 bg-white px-4 py-2 text-xs font-semibold">
+                          移除
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -830,11 +1363,13 @@ export function PortfolioClient({ funds }: { funds: FundListItem[] }) {
 function SummaryCard({
   label,
   value,
-  tone
+  tone,
+  note
 }: {
   label: string;
   value: string;
   tone?: "positive" | "negative";
+  note?: string;
 }) {
   return (
     <div className="rounded-2xl bg-mist/70 p-4">
@@ -842,6 +1377,7 @@ function SummaryCard({
       <p className={`mt-2 text-2xl font-semibold ${tone === "positive" ? "text-pine" : tone === "negative" ? "text-rose-700" : ""}`}>
         {value}
       </p>
+      {note ? <p className="mt-2 text-xs text-amber-700">{note}</p> : null}
     </div>
   );
 }

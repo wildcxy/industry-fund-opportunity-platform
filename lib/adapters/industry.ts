@@ -1,6 +1,9 @@
 import { fetchBackendJson } from "@/lib/backend-api";
-import { funds, industryCards, industryDetails } from "@/mock/data";
-import { HomepageViewData, IndustryDetailView, IndustryHomepageView } from "@/types";
+import { isDemoMode } from "@/lib/data-mode";
+import { MOCK_SNAPSHOT_UPDATED_AT } from "@/lib/mock-metadata";
+import { calculateIndustryEventImpact } from "@/lib/strategy/industry-events";
+import { funds, industryCards, industryDetails, mockIndustryLongTermEvents } from "@/mock/data";
+import { ChartPoint, DetailMetric, FundListItem, HomepageViewData, IndustryDetailView, IndustryHomepageView, MetricExplain, TimelineEvent } from "@/types";
 
 type HomepageResponse = {
   snapshot?: {
@@ -19,11 +22,98 @@ type IndustryDetailResponse = {
   };
 };
 
+const DATA_VERSION_LABELS: Record<string, string> = {
+  "tushare-industry-top10-v1": "Tushare行业基金池",
+  "manual-drop-v1": "盘后快照",
+  "portfolio-snapshot": "持仓快照"
+};
+
+function normalizeTag(tag: string) {
+  return DATA_VERSION_LABELS[tag] ?? tag;
+}
+
+function normalizeFundTags<T extends FundListItem>(fund: T): T {
+  return {
+    ...fund,
+    tags: Array.from(new Set((fund.tags ?? []).map(normalizeTag)))
+  };
+}
+
+function normalizeFunds<T extends FundListItem>(items?: T[]) {
+  return (items ?? []).map(normalizeFundTags);
+}
+
 function buildMethodology() {
   return {
     title: "评分口径",
     content: "综合趋势、资金、估值与风险因子进行样例展示，不构成投资建议。"
   };
+}
+
+function defaultMethodologyNotes(): MetricExplain[] {
+  return [
+    {
+      title: "趋势强度口径",
+      content: "参考近 20 日、60 日与 120 日代理动量，并结合回撤、波动和短期过热风险做观察优先级判断。"
+    },
+    {
+      title: "资金强度口径",
+      content: "参考行业相关基金池的热度、成交活跃度或资金流向代理指标；当前为盘后快照口径，不代表实时资金流。"
+    },
+    {
+      title: "估值与风险口径",
+      content: "估值只用于判断研究性价比，风险项重点关注拥挤度、波动、回撤和数据缺口；高风险会降低或阻断买入观察推进。"
+    },
+    {
+      title: "策略边界",
+      content: "本页只做个人研究观察，不输出自动交易或无条件买入结论；事件和热度必须与基金指标、持仓约束一起复核。"
+    }
+  ];
+}
+
+function buildCapitalHeatSeries(chartSeries: ChartPoint[], capitalMetrics: DetailMetric[]): ChartPoint[] {
+  const capitalPoint = chartSeries.find((point) => point.label.includes("资金"));
+  const base = capitalMetrics[0]?.score ?? capitalPoint?.value;
+  if (base === undefined) {
+    return [];
+  }
+
+  return [
+    { label: "低位参考", value: Math.max(0, Math.min(100, base - 10)) },
+    { label: "趋势确认", value: Math.max(0, Math.min(100, base - 4)) },
+    { label: "近期热度", value: Math.max(0, Math.min(100, base + 2)) },
+    { label: "当前资金", value: Math.max(0, Math.min(100, base)) }
+  ];
+}
+
+function buildLongTermEventsFromTimeline(
+  industryId: string,
+  industryName: string,
+  timelineEvents: TimelineEvent[],
+  riskMetrics: DetailMetric[]
+): NonNullable<IndustryDetailView["longTermEvents"]> {
+  const isHighRisk = (riskMetrics[0]?.score ?? 0) >= 75;
+
+  return timelineEvents.map((event, index) => ({
+    eventId: `${industryId}-${event.date}-${index + 1}`,
+    industryId,
+    industryName,
+    eventDate: event.date,
+    publishedAt: event.date,
+    sourceType: "manual_import",
+    sourceName: "行业事件快照",
+    title: event.title,
+    summary: event.summary,
+    category: "other",
+    longTermImpact: isHighRisk ? "risk_or_invalidation" : "long_term_support",
+    confidence: "medium",
+    freshness: "watch",
+    thesisEffect: event.summary,
+    riskNote: isHighRisk
+      ? "当前风险或拥挤度偏高，该事件只作为复核线索，不能单独推进买入观察。"
+      : "该事件只用于验证行业长期逻辑，仍需结合趋势、估值、资金和基金持仓匹配度复核。",
+    invalidationSignal: "后续数据无法验证事件兑现、资金退潮或风险评分继续抬升时，需要下调观察优先级。"
+  }));
 }
 
 function buildFallbackTrendStrategy(industryName: string) {
@@ -57,7 +147,7 @@ function buildHomepageFallback(): HomepageViewData {
           : "热度较高，适合观察强趋势与风险提示之间的平衡。",
     methodology: buildMethodology(),
     trendStrategy: buildFallbackTrendStrategy(item.industryName),
-    updatedAt: "2026-04-21 10:00",
+    updatedAt: MOCK_SNAPSHOT_UPDATED_AT,
     relatedFunds: funds.filter((fund) => fund.theme === item.industryName).slice(0, 2)
   }));
 
@@ -83,7 +173,7 @@ function buildHomepageFallback(): HomepageViewData {
         riskNote: "演示数据不构成买入建议。"
       }))
     },
-    updatedAt: "2026-04-21 10:00"
+    updatedAt: MOCK_SNAPSHOT_UPDATED_AT
   };
 }
 
@@ -95,6 +185,10 @@ function buildIndustryDetailFallback(industryId: string): IndustryDetailView | n
 
   return {
     ...detail,
+    eventImpactSummary: detail.eventImpactSummary ?? calculateIndustryEventImpact({
+      industryId,
+      events: detail.longTermEvents ?? mockIndustryLongTermEvents
+    }),
     conclusionCards: [
       {
         title: "当前判断",
@@ -123,18 +217,7 @@ function buildIndustryDetailFallback(industryId: string): IndustryDetailView | n
       }
     ],
     methodologyNotes: [
-      {
-        title: "趋势强度口径",
-        content: "参考近 5 日、20 日、60 日表现及相对基准的超额收益。"
-      },
-      {
-        title: "资金强度口径",
-        content: "参考行业相关 ETF 资金流向、成交额与市场关注度变化。"
-      },
-      {
-        title: "估值与风险口径",
-        content: "估值位置仅作区间展示，风险提示重点关注拥挤度、波动与短期涨幅。"
-      }
+      ...defaultMethodologyNotes()
     ],
     capitalHeatSeries:
       detail.capitalMetrics.length > 0
@@ -147,7 +230,31 @@ function buildIndustryDetailFallback(industryId: string): IndustryDetailView | n
   };
 }
 
-function mergeHomepageIndustry(item: Partial<IndustryHomepageView>, fallback: IndustryHomepageView): IndustryHomepageView {
+function mergeHomepageIndustry(item: Partial<IndustryHomepageView>, fallback: IndustryHomepageView, demoMode: boolean): IndustryHomepageView {
+  if (!demoMode) {
+    const industryName = item.industryName ?? item.industryId ?? "";
+    return {
+      industryId: item.industryId ?? industryName,
+      industryName,
+      opportunityScore: item.opportunityScore ?? 0,
+      trendScore: item.trendScore ?? 0,
+      capitalScore: item.capitalScore ?? 0,
+      valuationScore: item.valuationScore ?? 0,
+      riskLevel: item.riskLevel ?? fallback.riskLevel,
+      performance5d: item.performance5d ?? 0,
+      performance20d: item.performance20d ?? 0,
+      fundCount: item.fundCount ?? item.relatedFunds?.length ?? 0,
+      tags: item.tags ?? [],
+      summary: item.summary ?? "",
+      label: item.label ?? fallback.label,
+      focusReason: item.focusReason ?? "",
+      methodology: item.methodology,
+      updatedAt: item.updatedAt,
+      relatedFunds: normalizeFunds(item.relatedFunds),
+      trendStrategy: item.trendStrategy
+    };
+  }
+
   return {
     ...fallback,
     ...item,
@@ -156,105 +263,169 @@ function mergeHomepageIndustry(item: Partial<IndustryHomepageView>, fallback: In
     updatedAt: item.updatedAt ?? fallback.updatedAt,
     relatedFunds:
       item.relatedFunds && item.relatedFunds.length > 0
-        ? item.relatedFunds
-        : funds.filter((fund) => fund.theme === (item.industryName ?? fallback.industryName)).slice(0, 2),
+        ? normalizeFunds(item.relatedFunds)
+        : normalizeFunds(funds.filter((fund) => fund.theme === (item.industryName ?? fallback.industryName)).slice(0, 2)),
     trendStrategy: item.trendStrategy ?? fallback.trendStrategy
   };
 }
 
+function isMissingBackendIndustry(item: IndustryHomepageView, backendIndustryIds: Set<string>) {
+  return !backendIndustryIds.has(item.industryId);
+}
+
 export async function getHomepageIndustryView(): Promise<HomepageViewData> {
   const fallback = buildHomepageFallback();
+  const demoMode = isDemoMode();
 
   try {
-    const response = await fetchBackendJson<HomepageResponse>("/api/industries");
+    const response = await fetchBackendJson<HomepageResponse>("/api/industries", { revalidate: 60 });
     const industries = response.snapshot?.data?.industries;
     const marketOverview = response.snapshot?.data?.marketOverview;
     const globalFundPicks = response.snapshot?.data?.globalFundPicks;
 
     if (!industries || industries.length === 0 || !marketOverview) {
-      return fallback;
+      return demoMode
+        ? fallback
+        : {
+            industries: [],
+            marketOverview: marketOverview ?? {
+              summary: "后端真实行业快照暂不可用。",
+              strongTrendCount: 0,
+              lowPositionCount: 0
+            },
+            updatedAt: response.snapshot?.updatedAt
+          };
     }
 
+    const backendIndustryIds = new Set(industries.map((item) => item.industryId).filter((value): value is string => Boolean(value)));
     const mergedIndustries = industries.map((item) => {
       const fallbackItem =
         fallback.industries.find((industry) => industry.industryId === item.industryId) ?? fallback.industries[0];
 
-      return mergeHomepageIndustry(item, fallbackItem);
+      return mergeHomepageIndustry(item, fallbackItem, demoMode);
     });
+    const fallbackOnlyIndustries = demoMode ? fallback.industries.filter((item) => isMissingBackendIndustry(item, backendIndustryIds)) : [];
 
     return {
-      industries: mergedIndustries,
+      industries: [...mergedIndustries, ...fallbackOnlyIndustries],
       marketOverview,
-      globalFundPicks: globalFundPicks ?? fallback.globalFundPicks,
+      globalFundPicks: globalFundPicks ?? (demoMode ? fallback.globalFundPicks : undefined),
       updatedAt: response.snapshot?.updatedAt ?? fallback.updatedAt
     };
   } catch {
-    return fallback;
+    return demoMode
+      ? fallback
+      : {
+          industries: [],
+          marketOverview: {
+            summary: "后端真实行业快照暂不可用。",
+            strongTrendCount: 0,
+            lowPositionCount: 0
+          }
+        };
   }
 }
 
 export async function getIndustryDetailView(industryId: string): Promise<IndustryDetailView | null> {
   const fallback = buildIndustryDetailFallback(industryId);
+  const demoMode = isDemoMode();
 
   try {
-    const response = await fetchBackendJson<IndustryDetailResponse>(`/api/industries/${industryId}`);
+    const response = await fetchBackendJson<IndustryDetailResponse>(`/api/industries/${industryId}`, { revalidate: 60 });
     const snapshot = response.snapshot?.data;
 
     if (!snapshot) {
-      return fallback;
+      return demoMode ? fallback : null;
     }
+    const resolvedIndustryName = snapshot.industryName ?? (demoMode ? fallback?.industryName : undefined) ?? industryId;
+    const resolvedTimelineEvents =
+      snapshot.timelineEvents && snapshot.timelineEvents.length > 0
+        ? snapshot.timelineEvents
+        : demoMode
+          ? fallback?.timelineEvents ?? []
+          : [];
+    const resolvedTrendMetrics =
+      snapshot.trendMetrics && snapshot.trendMetrics.length > 0
+        ? snapshot.trendMetrics
+        : demoMode
+          ? fallback?.trendMetrics ?? []
+          : [];
+    const resolvedCapitalMetrics =
+      snapshot.capitalMetrics && snapshot.capitalMetrics.length > 0
+        ? snapshot.capitalMetrics
+        : demoMode
+          ? fallback?.capitalMetrics ?? []
+          : [];
+    const resolvedValuationMetrics =
+      snapshot.valuationMetrics && snapshot.valuationMetrics.length > 0
+        ? snapshot.valuationMetrics
+        : demoMode
+          ? fallback?.valuationMetrics ?? []
+          : [];
+    const resolvedRiskMetrics =
+      snapshot.riskMetrics && snapshot.riskMetrics.length > 0
+        ? snapshot.riskMetrics
+        : demoMode
+          ? fallback?.riskMetrics ?? []
+          : [];
+    const resolvedChartSeries =
+      snapshot.chartSeries && snapshot.chartSeries.length > 0
+        ? snapshot.chartSeries
+        : demoMode
+          ? fallback?.chartSeries ?? []
+          : [];
+    const resolvedLongTermEvents =
+      snapshot.longTermEvents && snapshot.longTermEvents.length > 0
+        ? snapshot.longTermEvents
+        : buildLongTermEventsFromTimeline(industryId, resolvedIndustryName, resolvedTimelineEvents, resolvedRiskMetrics);
 
     return {
-      ...(fallback ?? {}),
-      industryId: snapshot.industryId ?? fallback?.industryId ?? industryId,
-      industryName: snapshot.industryName ?? fallback?.industryName ?? industryId,
-      headline: snapshot.headline ?? fallback?.headline ?? "",
-      opportunityLabel: snapshot.opportunityLabel ?? fallback?.opportunityLabel ?? "趋势确认",
-      thesisSummary: snapshot.thesisSummary ?? fallback?.thesisSummary ?? snapshot.headline ?? "",
+      ...(demoMode ? fallback ?? {} : {}),
+      industryId: snapshot.industryId ?? (demoMode ? fallback?.industryId : undefined) ?? industryId,
+      industryName: resolvedIndustryName,
+      headline: snapshot.headline ?? (demoMode ? fallback?.headline : undefined) ?? "",
+      opportunityLabel: snapshot.opportunityLabel ?? (demoMode ? fallback?.opportunityLabel : undefined) ?? "趋势确认",
+      thesisSummary: snapshot.thesisSummary ?? (demoMode ? fallback?.thesisSummary : undefined) ?? snapshot.headline ?? "",
       conclusionCards:
         snapshot.conclusionCards && snapshot.conclusionCards.length > 0
           ? snapshot.conclusionCards
-          : fallback?.conclusionCards ?? [],
+          : demoMode
+            ? fallback?.conclusionCards ?? []
+            : [],
       timelineEvents:
-        snapshot.timelineEvents && snapshot.timelineEvents.length > 0
-          ? snapshot.timelineEvents
-          : fallback?.timelineEvents ?? [],
-      trendMetrics:
-        snapshot.trendMetrics && snapshot.trendMetrics.length > 0
-          ? snapshot.trendMetrics
-          : fallback?.trendMetrics ?? [],
-      capitalMetrics:
-        snapshot.capitalMetrics && snapshot.capitalMetrics.length > 0
-          ? snapshot.capitalMetrics
-          : fallback?.capitalMetrics ?? [],
-      valuationMetrics:
-        snapshot.valuationMetrics && snapshot.valuationMetrics.length > 0
-          ? snapshot.valuationMetrics
-          : fallback?.valuationMetrics ?? [],
-      riskMetrics:
-        snapshot.riskMetrics && snapshot.riskMetrics.length > 0
-          ? snapshot.riskMetrics
-          : fallback?.riskMetrics ?? [],
-      chartSeries:
-        snapshot.chartSeries && snapshot.chartSeries.length > 0
-          ? snapshot.chartSeries
-          : fallback?.chartSeries ?? [],
+        resolvedTimelineEvents,
+      trendMetrics: resolvedTrendMetrics,
+      capitalMetrics: resolvedCapitalMetrics,
+      valuationMetrics: resolvedValuationMetrics,
+      riskMetrics: resolvedRiskMetrics,
+      chartSeries: resolvedChartSeries,
       relatedFunds:
         snapshot.relatedFunds && snapshot.relatedFunds.length > 0
-          ? snapshot.relatedFunds
-          : fallback?.relatedFunds ?? [],
+          ? normalizeFunds(snapshot.relatedFunds)
+          : demoMode
+            ? normalizeFunds(fallback?.relatedFunds)
+            : [],
       methodologyNotes:
         snapshot.methodologyNotes && snapshot.methodologyNotes.length > 0
           ? snapshot.methodologyNotes
-          : fallback?.methodologyNotes ?? [],
+          : demoMode && fallback?.methodologyNotes?.length
+            ? fallback.methodologyNotes
+            : defaultMethodologyNotes(),
       capitalHeatSeries:
         snapshot.capitalHeatSeries && snapshot.capitalHeatSeries.length > 0
           ? snapshot.capitalHeatSeries
-          : fallback?.capitalHeatSeries ?? [],
-      trendStrategy: snapshot.trendStrategy ?? fallback?.trendStrategy,
-      disclaimer: snapshot.disclaimer ?? fallback?.disclaimer ?? ""
+          : buildCapitalHeatSeries(resolvedChartSeries, resolvedCapitalMetrics),
+      trendStrategy: snapshot.trendStrategy ?? (demoMode ? fallback?.trendStrategy : undefined),
+      longTermEvents: resolvedLongTermEvents,
+      eventImpactSummary:
+        snapshot.eventImpactSummary ??
+        calculateIndustryEventImpact({
+          industryId,
+          events: resolvedLongTermEvents.length > 0 ? resolvedLongTermEvents : demoMode ? fallback?.longTermEvents ?? mockIndustryLongTermEvents : []
+        }),
+      disclaimer: snapshot.disclaimer ?? (demoMode ? fallback?.disclaimer : undefined) ?? ""
     };
   } catch {
-    return fallback;
+    return demoMode ? fallback : null;
   }
 }

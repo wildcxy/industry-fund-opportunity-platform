@@ -10,6 +10,12 @@ from jobs.shared import build_batch_id, log_job_end, log_job_start, resolve_trad
 DATA_VERSION = "manual-drop-v1"
 
 
+def float_or_none(value) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
 def main() -> None:
     trade_date = resolve_trade_date(os.getenv("TRADE_DATE"))
     job_name = "fund-compare-snapshot-daily"
@@ -48,18 +54,18 @@ def main() -> None:
                             row["fund_id"],
                             Jsonb(
                                 {
-                                    "day1": float(row["return_1d"] or 0),
-                                    "month1": float(row["return_1m"] or 0),
-                                    "month3": float(row["return_3m"] or 0),
-                                    "month6": float(row["return_6m"] or 0),
-                                    "latestNav": float(row["latest_nav"] or 0),
-                                    "previousNav": float(row["previous_nav"] or 0),
+                                    "day1": float_or_none(row["return_1d"]),
+                                    "month1": float_or_none(row["return_1m"]),
+                                    "month3": float_or_none(row["return_3m"]),
+                                    "month6": float_or_none(row["return_6m"]),
+                                    "latestNav": float_or_none(row["latest_nav"]),
+                                    "previousNav": float_or_none(row["previous_nav"]),
                                 }
                             ),
                             Jsonb(
                                 {
-                                    "maxDrawdown": float(row["max_drawdown"] or 0),
-                                    "volatility": float(row["volatility"] or 0),
+                                    "maxDrawdown": float_or_none(row["max_drawdown"]),
+                                    "volatility": float_or_none(row["volatility"]),
                                 }
                             ),
                             row["fee_rate"],

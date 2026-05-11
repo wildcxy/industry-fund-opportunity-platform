@@ -8,6 +8,7 @@ import { TrendBars } from "@/components/trend-bars";
 import { getIndustryDetailView } from "@/lib/adapters/industry";
 import { formatAum, formatPercent, formatRate } from "@/lib/format";
 import { STORAGE_KEYS } from "@/lib/storage";
+import { IndustryEventImpactLabel } from "@/types";
 
 function MethodologyPanel({
   title,
@@ -24,11 +25,26 @@ function MethodologyPanel({
   );
 }
 
-function formatFundAumWithQuality(fund: { aum: number; missingMetrics?: string[] }) {
-  if (fund.missingMetrics?.includes("aum") || fund.aum <= 0) {
+function formatFundAumWithQuality(fund: { aum?: number | null; missingMetrics?: string[] }) {
+  if (fund.missingMetrics?.includes("aum") || fund.aum === null || fund.aum === undefined || fund.aum <= 0) {
     return "--";
   }
   return formatAum(fund.aum);
+}
+
+function eventImpactLabel(label: IndustryEventImpactLabel) {
+  if (label === "long_term_support") return "长期 thesis 支撑";
+  if (label === "risk_or_invalidation") return "风险/失效信号";
+  if (label === "short_term_noise") return "短期扰动";
+  if (label === "mixed") return "多空混合";
+  return "证据不足";
+}
+
+function eventImpactTone(label: IndustryEventImpactLabel) {
+  if (label === "long_term_support") return "bg-emerald-50 text-emerald-800";
+  if (label === "risk_or_invalidation") return "bg-rose-50 text-rose-800";
+  if (label === "short_term_noise") return "bg-amber-50 text-amber-800";
+  return "bg-mist text-ink/65";
 }
 
 export default async function IndustryDetailPage({
@@ -48,6 +64,24 @@ export default async function IndustryDetailPage({
     { title: "资金信号", metrics: detail.capitalMetrics },
     { title: "估值信号", metrics: detail.valuationMetrics },
     { title: "风险信号", metrics: detail.riskMetrics }
+  ];
+  const longTermEvents = detail.longTermEvents ?? [];
+  const eventGroups = [
+    {
+      label: "long_term_support" as const,
+      title: "长期 thesis 支撑",
+      items: longTermEvents.filter((event) => event.longTermImpact === "long_term_support" || event.longTermImpact === "mixed")
+    },
+    {
+      label: "risk_or_invalidation" as const,
+      title: "风险/失效信号",
+      items: longTermEvents.filter((event) => event.longTermImpact === "risk_or_invalidation" || event.longTermImpact === "insufficient_evidence")
+    },
+    {
+      label: "short_term_noise" as const,
+      title: "短期扰动",
+      items: longTermEvents.filter((event) => event.longTermImpact === "short_term_noise")
+    }
   ];
 
   return (
@@ -235,6 +269,60 @@ export default async function IndustryDetailPage({
                 近期暂无新增事件，建议结合趋势与估值综合判断。
               </div>
             )}
+          </div>
+        </div>
+
+        <div className="panel p-6">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <p className="eyebrow">Long-Term Events</p>
+              <h2 className="mt-2 text-2xl font-semibold">长期事件影响</h2>
+              <p className="mt-3 text-sm leading-7 text-ink/62">
+                事件只用于验证行业长期逻辑、风险和失效条件，不作为短线交易信号。
+              </p>
+            </div>
+            {detail.eventImpactSummary ? (
+              <span className={`w-fit rounded-full px-3 py-1 text-xs font-semibold ${eventImpactTone(detail.eventImpactSummary.impactDirection)}`}>
+                {eventImpactLabel(detail.eventImpactSummary.impactDirection)} / {detail.eventImpactSummary.confidence}
+              </span>
+            ) : null}
+          </div>
+          {detail.eventImpactSummary ? (
+            <div className="mt-4 rounded-2xl bg-mist/55 p-4 text-sm leading-7 text-ink/65">
+              <p>{detail.eventImpactSummary.riskControlHint}</p>
+              {detail.eventImpactSummary.invalidationConditions.length ? (
+                <p className="mt-2 text-rose-800">失效条件：{detail.eventImpactSummary.invalidationConditions.join("；")}</p>
+              ) : null}
+            </div>
+          ) : null}
+          <div className="mt-5 grid gap-4">
+            {eventGroups.map((group) => (
+              <div key={group.title} className="rounded-2xl border border-ink/10 bg-white p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="font-semibold">{group.title}</p>
+                  <span className="rounded-full bg-mist px-2 py-1 text-xs font-semibold text-pine">{group.items.length} 条</span>
+                </div>
+                <div className="mt-3 space-y-3">
+                  {group.items.length ? (
+                    group.items.map((event) => (
+                      <article key={event.eventId} className="rounded-xl bg-mist/55 p-3">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className={`rounded-full px-2 py-1 text-xs font-semibold ${eventImpactTone(event.longTermImpact)}`}>
+                            {eventImpactLabel(event.longTermImpact)}
+                          </span>
+                          <span className="text-xs text-ink/48">{event.eventDate} / {event.sourceName}</span>
+                        </div>
+                        <p className="mt-2 font-semibold">{event.title}</p>
+                        <p className="mt-2 text-sm leading-6 text-ink/65">{event.thesisEffect}</p>
+                        <p className="mt-1 text-xs leading-5 text-ink/55">{event.riskNote}</p>
+                      </article>
+                    ))
+                  ) : (
+                    <p className="text-sm leading-6 text-ink/55">暂无该类长期事件证据。</p>
+                  )}
+                </div>
+              </div>
+            ))}
           </div>
         </div>
 

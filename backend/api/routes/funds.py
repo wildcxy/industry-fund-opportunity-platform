@@ -19,7 +19,7 @@ from db.queries.funds import list_funds_snapshot
 from db.queries.holdings import get_fund_holding_view
 from db.queries.snapshots import count_rows, get_latest_publish_status
 from jobs.shared import resolve_trade_date
-from jobs.single_fund_collect import collect_single_fund
+from jobs.single_fund_collect import collect_single_fund, get_cached_single_fund_collection
 from providers import AKShareFundProvider, ProProvider
 
 router = APIRouter()
@@ -109,9 +109,17 @@ def refresh_visible_funds(payload: RefreshVisibleRequest) -> dict:
     normalized_codes = normalized_codes[:30]
     results = []
     success_count = 0
+    cached_count = 0
     provider = AKShareFundProvider()
     for code in normalized_codes:
         try:
+            cached = get_cached_single_fund_collection(code, trade_date)
+            if cached:
+                results.append({"fundCode": code, "status": "cached", "collection": cached})
+                success_count += 1
+                cached_count += 1
+                continue
+
             collection = collect_single_fund(code, trade_date, provider)
             results.append({"fundCode": code, "status": "ok", "collection": collection})
             success_count += 1
@@ -123,6 +131,7 @@ def refresh_visible_funds(payload: RefreshVisibleRequest) -> dict:
         "tradeDate": trade_date.isoformat(),
         "requestedCount": len(normalized_codes),
         "successCount": success_count,
+        "cachedCount": cached_count,
         "failedCount": len(normalized_codes) - success_count,
         "results": results,
     }
@@ -150,6 +159,14 @@ def collect_candidate(fund_code: str) -> dict:
         raise HTTPException(status_code=404, detail="Fund must be added to candidates before collection.")
 
     trade_date = resolve_trade_date(os.getenv("TRADE_DATE"))
+    cached = get_cached_single_fund_collection(normalized, trade_date)
+    if cached:
+        return {
+            "status": "cached",
+            "collection": cached,
+            "candidate": get_collection_status(normalized),
+        }
+
     task = create_collection_task(candidate["fund_id"], normalized)
     mark_collection_started(task["task_id"], normalized)
 

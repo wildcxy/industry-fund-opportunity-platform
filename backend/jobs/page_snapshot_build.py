@@ -15,10 +15,52 @@ FALLBACK_DATA_VERSION = "manual-drop-v1"
 AUTO_TOP10_DATA_VERSION = "tushare-industry-top10-v1"
 
 
+def as_float_or_none(value) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def score_input(value, neutral: float = 0.0) -> float:
+    parsed = as_float_or_none(value)
+    return neutral if parsed is None else parsed
+
+
+def score_component(value: float | None, low: float, high: float, missing: float = 45.0) -> float:
+    if value is None:
+        return missing
+    return max(0.0, min(100.0, (value - low) / (high - low) * 100.0))
+
+
+def public_data_tag(data_version: str | None) -> str:
+    if data_version == AUTO_TOP10_DATA_VERSION:
+        return "Tushare行业基金池"
+    if data_version == FALLBACK_DATA_VERSION:
+        return "盘后快照"
+    if data_version == "portfolio-snapshot":
+        return "持仓快照"
+    return "数据快照"
+
+
+def clamp_score(value: float) -> int:
+    return int(max(0.0, min(100.0, round(value))))
+
+
+def fmt_percent_or_pending(value: float | None) -> str:
+    return "待补" if value is None else f"{value:.1f}%"
+
+
+def core_metric_completeness(fund: dict) -> float:
+    keys = ("return_1m", "return_3m", "return_6m", "max_drawdown", "volatility", "founded_years")
+    present = sum(1 for key in keys if as_float_or_none(fund.get(key)) is not None)
+    return present / len(keys)
+
+
 def resolve_industry_data_context(cur, requested_trade_date) -> tuple[date, str]:
     configured = get_settings().active_data_version
     version_filter = "and data_version = %s" if configured and configured != "latest" else ""
     params = (requested_trade_date, configured) if version_filter else (requested_trade_date,)
+    version_order = "max(updated_at) desc" if version_filter else f"case when data_version = '{FALLBACK_DATA_VERSION}' then 1 else 0 end, max(updated_at) desc"
     cur.execute(
         f"""
         select trade_date, data_version
@@ -26,7 +68,7 @@ def resolve_industry_data_context(cur, requested_trade_date) -> tuple[date, str]
         where trade_date <= %s
         {version_filter}
         group by trade_date, data_version
-        order by trade_date desc, max(updated_at) desc
+        order by trade_date desc, {version_order}
         limit 1
         """,
         params,
@@ -35,6 +77,53 @@ def resolve_industry_data_context(cur, requested_trade_date) -> tuple[date, str]
     if row:
         return row["trade_date"], row["data_version"]
     return requested_trade_date, configured if configured and configured != "latest" else FALLBACK_DATA_VERSION
+
+
+def load_industries_with_supplements(cur, trade_date: date, data_version: str) -> list[dict]:
+    base_select = """
+        select
+            iod.*,
+            idm.performance_5d,
+            idm.performance_20d,
+            idm.performance_60d,
+            idm.risk_score,
+            idm.fund_count,
+            im.industry_name
+        from industry_opportunity_daily iod
+        join industry_daily_metrics idm
+          on idm.trade_date = iod.trade_date
+         and idm.industry_id = iod.industry_id
+         and idm.data_version = iod.data_version
+        join industry_master im on im.industry_id = iod.industry_id
+        where iod.trade_date = %s and iod.data_version = %s
+    """
+    if data_version == FALLBACK_DATA_VERSION:
+        cur.execute(f"{base_select} order by iod.opportunity_score desc", (trade_date, data_version))
+        return cur.fetchall()
+
+    cur.execute(
+        f"""
+        with primary_rows as (
+            {base_select}
+        ),
+        supplemental_rows as (
+            {base_select}
+        )
+        select *
+        from primary_rows
+        union all
+        select *
+        from supplemental_rows s
+        where not exists (
+            select 1
+            from primary_rows p
+            where p.industry_id = s.industry_id
+        )
+        order by opportunity_score desc
+        """,
+        (trade_date, data_version, trade_date, FALLBACK_DATA_VERSION),
+    )
+    return cur.fetchall()
 
 
 def build_risk_hint(risk_level: str | None) -> str:
@@ -54,30 +143,109 @@ def methodology_notes() -> list[dict[str, str]]:
     ]
 
 
+def build_capital_heat_series(row: dict) -> list[dict[str, int | str]]:
+    capital_score = score_input(row.get("capital_score"), 0)
+    performance_5d = score_input(row.get("performance_5d"), 0)
+    performance_20d = score_input(row.get("performance_20d"), 0)
+    performance_60d = score_input(row.get("performance_60d"), performance_20d)
+    return [
+        {"label": "60日代理", "value": clamp_score(capital_score - 8 + performance_60d * 0.15)},
+        {"label": "20日代理", "value": clamp_score(capital_score - 3 + performance_20d * 0.2)},
+        {"label": "5日代理", "value": clamp_score(capital_score + performance_5d * 0.45)},
+        {"label": "当前热度", "value": clamp_score(capital_score)},
+    ]
+
+
+def build_long_term_events(row: dict, events: list[dict]) -> list[dict]:
+    industry_id = row["industry_id"]
+    industry_name = row["industry_name"]
+    risk_score = int(row["risk_score"] or 0)
+    risk_level = build_risk_hint(row["risk_level"])
+    output = []
+    for index, event in enumerate(events, start=1):
+        impact = "risk_or_invalidation" if risk_score >= 75 or risk_level == "高" else "long_term_support"
+        risk_note = (
+            "当前拥挤度或风险评分偏高，该事件只能作为复核线索，不能单独推动买入计划。"
+            if impact == "risk_or_invalidation"
+            else "仍需结合趋势、估值、资金和基金持仓匹配度继续验证，不能作为短线交易信号。"
+        )
+        output.append(
+            {
+                "eventId": f"{industry_id}-{event['event_date'].isoformat()}-{index}",
+                "industryId": industry_id,
+                "industryName": industry_name,
+                "eventDate": event["event_date"].isoformat(),
+                "publishedAt": event["event_date"].isoformat(),
+                "sourceType": "manual_import",
+                "sourceName": "行业事件快照",
+                "title": event["event_title"],
+                "summary": event["event_summary"],
+                "category": "other",
+                "longTermImpact": impact,
+                "confidence": "medium",
+                "freshness": "watch",
+                "thesisEffect": event["event_summary"],
+                "riskNote": risk_note,
+                "invalidationSignal": "后续数据不支持事件兑现、资金显著退潮或风险评分继续抬升时，需要下调观察优先级。",
+            }
+        )
+    return output
+
+
+def build_event_impact_summary(row: dict, long_term_events: list[dict]) -> dict:
+    support_count = sum(1 for event in long_term_events if event["longTermImpact"] == "long_term_support")
+    risk_count = sum(1 for event in long_term_events if event["longTermImpact"] == "risk_or_invalidation")
+    short_term_noise_count = sum(1 for event in long_term_events if event["longTermImpact"] == "short_term_noise")
+    impact_direction = "risk_or_invalidation" if risk_count > 0 and risk_count >= support_count else "long_term_support"
+    return {
+        "industryId": row["industry_id"],
+        "asOfDate": row["trade_date"].isoformat(),
+        "supportCount": support_count,
+        "riskCount": risk_count,
+        "shortTermNoiseCount": short_term_noise_count,
+        "confidence": "medium" if long_term_events else "low",
+        "impactDirection": impact_direction if long_term_events else "insufficient_evidence",
+        "supportingEvidence": [
+            event["title"] for event in long_term_events if event["longTermImpact"] == "long_term_support"
+        ],
+        "weakeningEvidence": [
+            event["title"] for event in long_term_events if event["longTermImpact"] == "risk_or_invalidation"
+        ],
+        "invalidationConditions": [
+            "事件兑现弱于预期或后续数据无法验证产业逻辑",
+            "短期拥挤度继续抬升且回撤扩大",
+            "相关基金持仓映射与行业主线明显不匹配",
+        ],
+        "riskControlHint": "长期事件只用于验证行业逻辑、风险和失效条件，不作为短线交易信号，也不能绕过风险阻断。",
+        "methodology": "事件按长期支撑、风险/失效和短期扰动分组，最终观察状态仍由确定性趋势、资金、估值和风险规则决定。",
+    }
+
+
 def fund_rank_score(fund: dict) -> float:
-    return_1m = float(fund["return_1m"] or 0)
-    return_3m = float(fund["return_3m"] or 0)
-    return_6m = float(fund["return_6m"] or 0)
-    max_drawdown = float(fund["max_drawdown"] or 0)
-    volatility = float(fund["volatility"] or 0)
-    age = float(fund["founded_years"] or 0)
+    return_1m = as_float_or_none(fund["return_1m"])
+    return_3m = as_float_or_none(fund["return_3m"])
+    return_6m = as_float_or_none(fund["return_6m"])
+    max_drawdown = as_float_or_none(fund["max_drawdown"])
+    volatility = as_float_or_none(fund["volatility"])
+    age = as_float_or_none(fund["founded_years"])
     score = (
-        max(0, min(100, (return_3m + 15) / 45 * 100)) * 0.30
-        + max(0, min(100, (return_1m + 8) / 26 * 100)) * 0.16
-        + max(0, min(100, (return_6m + 20) / 65 * 100)) * 0.14
-        + max(0, min(100, 100 + max_drawdown * 3)) * 0.18
-        + max(0, min(100, 100 - max(volatility - 12, 0) * 2.8)) * 0.12
-        + max(0, min(100, age / 5 * 100)) * 0.10
+        score_component(return_3m, -15, 30) * 0.30
+        + score_component(return_1m, -8, 18) * 0.16
+        + score_component(return_6m, -20, 45) * 0.14
+        + (45.0 if max_drawdown is None else max(0, min(100, 100 + max_drawdown * 3))) * 0.18
+        + (45.0 if volatility is None else max(0, min(100, 100 - max(volatility - 12, 0) * 2.8))) * 0.12
+        + (45.0 if age is None else max(0, min(100, age / 5 * 100))) * 0.10
     )
-    return round(score, 2)
+    completeness_penalty = (1.0 - core_metric_completeness(fund)) * 12.0
+    return round(max(0.0, score - completeness_penalty), 2)
 
 
 def fund_rank_signal(score: float, fund: dict) -> str:
-    return_1m = float(fund["return_1m"] or 0)
-    max_drawdown = float(fund["max_drawdown"] or 0)
-    if max_drawdown <= -25:
+    return_1m = as_float_or_none(fund["return_1m"])
+    max_drawdown = as_float_or_none(fund["max_drawdown"])
+    if max_drawdown is not None and max_drawdown <= -25:
         return "高回撤观察"
-    if return_1m >= 18:
+    if return_1m is not None and return_1m >= 18:
         return "短期强势不追高"
     if score >= 75:
         return "优先观察"
@@ -205,6 +373,11 @@ def build_fund_payload(fund: dict, score: float, signal: str, tags: list[str]) -
     missing_metrics = []
     if aum is None:
         missing_metrics.append("aum")
+    payload_tags = list(tags)
+    if fund.get("concentration_label") and str(fund["concentration_label"]).startswith("光通信链持仓"):
+        payload_tags.append(str(fund["concentration_label"]))
+    for holding_name in (fund.get("top_holdings_json") or [])[:3]:
+        payload_tags.append(str(holding_name))
     payload = {
         "fundId": fund["fund_id"],
         "fundName": fund["fund_name"],
@@ -212,16 +385,16 @@ def build_fund_payload(fund: dict, score: float, signal: str, tags: list[str]) -
         "fundType": fund["fund_type"],
         "theme": fund["theme"],
         "trackingTarget": fund["tracking_target"],
-        "return1d": float(fund["return_1d"] or 0),
-        "return1m": float(fund["return_1m"] or 0),
-        "return3m": float(fund["return_3m"] or 0),
-        "return6m": float(fund["return_6m"] or 0),
-        "maxDrawdown": float(fund["max_drawdown"] or 0),
-        "volatility": float(fund["volatility"] or 0),
-        "aum": aum or 0,
-        "feeRate": float(fund["fee_rate"] or 0),
+        "return1d": as_float_or_none(fund["return_1d"]),
+        "return1m": as_float_or_none(fund["return_1m"]),
+        "return3m": as_float_or_none(fund["return_3m"]),
+        "return6m": as_float_or_none(fund["return_6m"]),
+        "maxDrawdown": as_float_or_none(fund["max_drawdown"]),
+        "volatility": as_float_or_none(fund["volatility"]),
+        "aum": aum,
+        "feeRate": as_float_or_none(fund["fee_rate"]),
         "tradableOnExchange": fund["tradable_on_exchange"],
-        "tags": tags,
+        "tags": payload_tags[:8],
         "foundedYears": fund["founded_years"],
         "fundCompany": fund["fund_company"],
         "rankingScore": score,
@@ -280,13 +453,13 @@ def fund_theme_text(fund: dict) -> str:
     return f"{fund.get('theme') or ''} {fund.get('fund_name') or ''} {fund.get('tracking_target') or ''}".upper()
 
 
-def industry_context(fund: dict, return_1m: float, return_3m: float, return_6m: float) -> dict[str, object]:
+def industry_context(fund: dict, return_1m: float | None, return_3m: float | None, return_6m: float | None) -> dict[str, object]:
     text = fund_theme_text(fund)
     is_structural_growth = any(keyword.upper() in text for keyword in STRUCTURAL_GROWTH_KEYWORDS)
     is_mean_reversion = any(keyword.upper() in text for keyword in MEAN_REVERSION_KEYWORDS)
     is_long_hold = any(keyword.upper() in text for keyword in LONG_HOLD_KEYWORDS)
-    trend_confirmed = return_1m > 8 and return_3m > 6 and return_6m > 5
-    if is_long_hold and trend_confirmed and return_3m > 15 and return_6m > 25:
+    trend_confirmed = return_1m is not None and return_3m is not None and return_6m is not None and return_1m > 8 and return_3m > 6 and return_6m > 5
+    if is_long_hold and trend_confirmed and return_3m is not None and return_6m is not None and return_3m > 15 and return_6m > 25:
         strength = "长期持有趋势确认"
         bonus = 7.5
         overheat_multiplier = 0.25
@@ -329,28 +502,34 @@ def industry_context(fund: dict, return_1m: float, return_3m: float, return_6m: 
 
 def global_observation_score(fund: dict) -> tuple[float, str, str, str]:
     base_score = fund_rank_score(fund)
-    return_1m = float(fund["return_1m"] or 0)
-    return_3m = float(fund["return_3m"] or 0)
-    return_6m = float(fund["return_6m"] or 0)
-    max_drawdown = float(fund["max_drawdown"] or 0)
-    volatility = float(fund["volatility"] or 0)
-    context = industry_context(fund, return_1m, return_3m, return_6m)
+    return_1m_raw = as_float_or_none(fund["return_1m"])
+    return_3m_raw = as_float_or_none(fund["return_3m"])
+    return_6m_raw = as_float_or_none(fund["return_6m"])
+    max_drawdown_raw = as_float_or_none(fund["max_drawdown"])
+    volatility_raw = as_float_or_none(fund["volatility"])
+    context = industry_context(fund, return_1m_raw, return_3m_raw, return_6m_raw)
+    return_1m = return_1m_raw if return_1m_raw is not None else -999.0
+    return_3m = return_3m_raw if return_3m_raw is not None else -999.0
+    return_6m = return_6m_raw if return_6m_raw is not None else -999.0
+    max_drawdown = max_drawdown_raw if max_drawdown_raw is not None else 0.0
+    volatility = volatility_raw if volatility_raw is not None else 999.0
     is_held = bool(fund.get("is_held"))
     market_value = float(fund.get("market_value_snapshot") or 0)
     holding_return = float(fund.get("holding_return_snapshot") or 0)
 
-    overheat_penalty = max(0.0, return_1m - 16.0) * 1.35 * float(context["overheatMultiplier"])
-    drawdown_penalty = max(0.0, abs(max_drawdown) - 22.0) * 0.9
-    volatility_penalty = max(0.0, volatility - 34.0) * 0.45 * float(context["volatilityMultiplier"])
-    trend_bonus = 4.0 if return_3m > 8 and return_6m > 10 else 0.0
+    overheat_penalty = max(0.0, return_1m_raw - 16.0) * 1.35 * float(context["overheatMultiplier"]) if return_1m_raw is not None else 0.0
+    drawdown_penalty = max(0.0, abs(max_drawdown_raw) - 22.0) * 0.9 if max_drawdown_raw is not None else 4.0
+    volatility_penalty = max(0.0, volatility_raw - 34.0) * 0.45 * float(context["volatilityMultiplier"]) if volatility_raw is not None else 3.0
+    trend_bonus = 4.0 if return_3m_raw is not None and return_6m_raw is not None and return_3m_raw > 8 and return_6m_raw > 10 else 0.0
     held_bonus = 0.0
-    if is_held and return_3m > 15 and return_6m > 25:
+    if is_held and return_3m_raw is not None and return_6m_raw is not None and return_3m_raw > 15 and return_6m_raw > 25:
         held_bonus = 10.0
-    elif is_held and return_3m > 10 and return_6m > 15:
+    elif is_held and return_3m_raw is not None and return_6m_raw is not None and return_3m_raw > 10 and return_6m_raw > 15:
         held_bonus = 6.0
     if is_held and market_value >= 30000 and holding_return >= 10:
         held_bonus += 2.0
-    score = round(max(0.0, min(100.0, base_score + trend_bonus + float(context["bonus"]) + held_bonus - overheat_penalty - drawdown_penalty - volatility_penalty)), 2)
+    completeness_penalty = (1.0 - core_metric_completeness(fund)) * 10.0
+    score = round(max(0.0, min(100.0, base_score + trend_bonus + float(context["bonus"]) + held_bonus - overheat_penalty - drawdown_penalty - volatility_penalty - completeness_penalty)), 2)
 
     if is_held and context["strength"] == "长期持有趋势确认" and score >= 66:
         action_label = "已持有，长期趋势优先复盘"
@@ -367,7 +546,7 @@ def global_observation_score(fund: dict) -> tuple[float, str, str, str]:
     elif return_1m >= 18:
         action_label = "强势观察，不追高"
         reason = "近1月涨幅较快但行业证据未充分确认，更适合等回调，不宜只因涨幅追入。"
-    elif max_drawdown <= -25:
+    elif max_drawdown_raw is not None and max_drawdown <= -25:
         action_label = "回撤修复观察"
         reason = "回撤较深，若中期动量恢复，可作为修复型观察候选。"
     elif context["strength"] == "低位未确认":
@@ -376,7 +555,7 @@ def global_observation_score(fund: dict) -> tuple[float, str, str, str]:
     elif score >= 68:
         action_label = "小仓观察候选"
         reason = f"{context['strength']}，且中期收益、回撤控制和波动控制相对更均衡，适合优先复盘。"
-    elif return_3m > 8 and max_drawdown > -22:
+    elif return_3m_raw is not None and max_drawdown_raw is not None and return_3m > 8 and max_drawdown > -22:
         action_label = "继续跟踪候选"
         reason = "中期动量尚可，回撤未明显失控，适合进入观察池。"
     else:
@@ -387,7 +566,223 @@ def global_observation_score(fund: dict) -> tuple[float, str, str, str]:
     return score, action_label, reason, risk_note
 
 
+def _global_position_limit(fund: dict) -> float:
+    context_text = fund_theme_text(fund)
+    if any(keyword.upper() in context_text for keyword in LONG_HOLD_KEYWORDS):
+        return 18.0
+    if any(keyword.upper() in context_text for keyword in STRUCTURAL_GROWTH_KEYWORDS):
+        return 10.0
+    return 12.0
+
+
+def _legacy_global_decision_timing(fund: dict, observation_score: float, total_portfolio_value: float = 0.0) -> dict[str, object]:
+    return_1m_raw = as_float_or_none(fund["return_1m"])
+    return_3m_raw = as_float_or_none(fund["return_3m"])
+    return_6m_raw = as_float_or_none(fund["return_6m"])
+    max_drawdown_raw = as_float_or_none(fund["max_drawdown"])
+    volatility_raw = as_float_or_none(fund["volatility"])
+    return_1m = return_1m_raw if return_1m_raw is not None else -999.0
+    return_3m = return_3m_raw if return_3m_raw is not None else -999.0
+    return_6m = return_6m_raw if return_6m_raw is not None else -999.0
+    max_drawdown = max_drawdown_raw if max_drawdown_raw is not None else 0.0
+    volatility = volatility_raw if volatility_raw is not None else 999.0
+    founded_years_raw = as_float_or_none(fund["founded_years"])
+    founded_years = int(founded_years_raw) if founded_years_raw is not None else 0
+    is_held = bool(fund.get("is_held"))
+    market_value = float(fund.get("market_value_snapshot") or 0)
+    position_ratio = round(market_value / total_portfolio_value * 100, 2) if total_portfolio_value else 0.0
+    position_limit = _global_position_limit(fund)
+    context = industry_context(fund, return_1m_raw, return_3m_raw, return_6m_raw)
+
+    overheat = return_1m_raw is not None and return_1m >= 18
+    trend_confirmed = return_3m_raw is not None and return_6m_raw is not None and return_3m > 8 and return_6m > 10
+    risk_control_ok = max_drawdown_raw is not None and volatility_raw is not None and max_drawdown > -22 and volatility < 32
+    data_quality_ok = founded_years >= 2
+
+    buy_readiness_score = observation_score
+    if overheat:
+        buy_readiness_score -= 14
+    if max_drawdown_raw is not None and max_drawdown <= -25:
+        buy_readiness_score -= 12
+    if volatility_raw is not None and volatility >= 34:
+        buy_readiness_score -= 8
+    if not trend_confirmed:
+        buy_readiness_score -= 8
+    if not data_quality_ok:
+        buy_readiness_score -= 5
+    buy_readiness_score -= (1.0 - core_metric_completeness(fund)) * 12.0
+    if is_held:
+        buy_readiness_score -= 4
+    if is_held and position_ratio >= position_limit:
+        buy_readiness_score -= 28
+    buy_readiness_score = round(max(0.0, min(100.0, buy_readiness_score)), 2)
+
+    if is_held and position_ratio >= position_limit * 1.35:
+        decision_stage = "控仓优先"
+        next_action = "这只基金仓位明显超过建议上限，先做再平衡复盘，不再把高分理解成加仓。"
+        position_advice = f"当前约 {position_ratio:.1f}%；建议上限约 {position_limit:.0f}%，新增资金应转为观察或分散。"
+    elif is_held and position_ratio >= position_limit:
+        decision_stage = "暂停加仓"
+        next_action = "仓位已到建议上限附近，保持观察，新增资金等待回调或转向低相关候选。"
+        position_advice = f"当前约 {position_ratio:.1f}%；建议上限约 {position_limit:.0f}%。"
+    elif (max_drawdown_raw is not None and max_drawdown <= -28) or (return_1m_raw is not None and return_3m_raw is not None and return_1m < -10 and return_3m < 0):
+        decision_stage = "减仓复盘"
+        next_action = "先复盘趋势是否破坏，暂停新增仓位；若连续走弱，优先控制仓位。"
+        position_advice = "高波动或趋势破坏阶段，适合把单只基金控制在组合低占比，避免越跌越集中。"
+    elif is_held and trend_confirmed and risk_control_ok:
+        decision_stage = "继续持有"
+        next_action = "持有优先，新增资金只在明显回调或组合再平衡时考虑。"
+        position_advice = "已有仓位先看上限和回撤承受力；不因观察分高自动加仓。"
+    elif overheat and trend_confirmed:
+        decision_stage = "等回调"
+        next_action = "主线仍强，但短期涨幅偏快；等待回撤、缩量企稳或分批节奏。"
+        position_advice = "外部候选只适合观察或很小仓试探，避免一次性追高。"
+    elif buy_readiness_score >= 72 and risk_control_ok:
+        decision_stage = "可小仓观察"
+        next_action = "满足趋势和风险条件后，可考虑小仓分批观察，不做重仓买入信号。"
+        position_advice = "首次观察仓建议保持轻量，后续用回撤和行业证据决定是否提高仓位。"
+    elif context["strength"] == "低位未确认":
+        decision_stage = "只观察"
+        next_action = "低位还没有趋势确认，先等待资金、趋势或行业证据改善。"
+        position_advice = "不要因为便宜直接补仓；先用观察池跟踪。"
+    else:
+        decision_stage = "继续验证"
+        next_action = "证据还不够完整，继续跟踪近1月、近3月趋势和回撤变化。"
+        position_advice = "暂不提高仓位优先级。"
+
+    if overheat:
+        buy_trigger = "等待从近1月高位回撤约5%-8%，且近3月趋势仍为正时，再评估分批。"
+    elif buy_readiness_score >= 72:
+        buy_trigger = "近1月不过热、近3月和近6月趋势保持为正、回撤未扩大时，才进入小仓观察。"
+    else:
+        buy_trigger = "先等观察分稳定在72以上，并确认行业趋势、回撤和波动没有恶化。"
+
+    sell_trigger = "若近1月转负且近3月跌破0，或最大回撤扩大到-25%以下，需要暂停加仓并做减仓复盘。"
+    if is_held:
+        sell_trigger = "已持有时，若中期趋势转弱、最大回撤跌破-25%或单只占比超过自身上限，应优先复盘减仓/控仓。"
+
+    return {
+        "decisionStage": decision_stage,
+        "buyReadinessScore": buy_readiness_score,
+        "nextAction": next_action,
+        "buyTrigger": buy_trigger,
+        "sellTrigger": sell_trigger,
+        "positionAdvice": position_advice,
+        "confidence": "high" if data_quality_ok and risk_control_ok else "medium" if data_quality_ok else "low",
+        "positionRatio": position_ratio,
+        "positionLimit": position_limit,
+        "checklist": [
+            f"近1月涨幅 {return_1m:.1f}%，{'偏热，避免追高' if overheat else '未触发追高惩罚'}。",
+            f"近3月/近6月为 {return_3m:.1f}% / {return_6m:.1f}%，{'中期趋势确认' if trend_confirmed else '中期趋势仍需验证'}。",
+            f"最大回撤 {max_drawdown:.1f}%，波动率 {volatility:.1f}%，{'风险暂可控' if risk_control_ok else '风险控制需要谨慎'}。",
+        ],
+    }
+
+
+def global_decision_timing(fund: dict, observation_score: float, total_portfolio_value: float = 0.0) -> dict[str, object]:
+    return_1m = as_float_or_none(fund["return_1m"])
+    return_3m = as_float_or_none(fund["return_3m"])
+    return_6m = as_float_or_none(fund["return_6m"])
+    max_drawdown = as_float_or_none(fund["max_drawdown"])
+    volatility = as_float_or_none(fund["volatility"])
+    founded_years = as_float_or_none(fund["founded_years"])
+    is_held = bool(fund.get("is_held"))
+    market_value = float(fund.get("market_value_snapshot") or 0)
+    position_ratio = round(market_value / total_portfolio_value * 100, 2) if total_portfolio_value else 0.0
+    position_limit = _global_position_limit(fund)
+    context = industry_context(fund, return_1m, return_3m, return_6m)
+
+    overheat = return_1m is not None and return_1m >= 18
+    trend_confirmed = return_3m is not None and return_6m is not None and return_3m > 8 and return_6m > 10
+    risk_control_ok = max_drawdown is not None and volatility is not None and max_drawdown > -22 and volatility < 32
+    data_quality_ok = founded_years is not None and founded_years >= 2 and core_metric_completeness(fund) >= 0.75
+
+    buy_readiness_score = observation_score
+    if overheat:
+        buy_readiness_score -= 14
+    if max_drawdown is None:
+        buy_readiness_score -= 10
+    elif max_drawdown <= -25:
+        buy_readiness_score -= 12
+    if volatility is None:
+        buy_readiness_score -= 8
+    elif volatility >= 34:
+        buy_readiness_score -= 8
+    if not trend_confirmed:
+        buy_readiness_score -= 8
+    if not data_quality_ok:
+        buy_readiness_score -= 5
+    buy_readiness_score -= (1.0 - core_metric_completeness(fund)) * 12.0
+    if is_held:
+        buy_readiness_score -= 4
+    if is_held and position_ratio >= position_limit:
+        buy_readiness_score -= 28
+    buy_readiness_score = round(max(0.0, min(100.0, buy_readiness_score)), 2)
+
+    if is_held and position_ratio >= position_limit * 1.35:
+        decision_stage = "position_control_review"
+        next_action = "Position is above the suggested limit; prioritize risk review before any new allocation."
+        position_advice = f"Current ratio is about {position_ratio:.1f}%; suggested limit is about {position_limit:.0f}%."
+    elif is_held and position_ratio >= position_limit:
+        decision_stage = "pause_addition"
+        next_action = "Position is near the suggested limit; keep observing and wait for portfolio rebalance conditions."
+        position_advice = f"Current ratio is about {position_ratio:.1f}%; suggested limit is about {position_limit:.0f}%."
+    elif (max_drawdown is not None and max_drawdown <= -28) or (return_1m is not None and return_3m is not None and return_1m < -10 and return_3m < 0):
+        decision_stage = "risk_review"
+        next_action = "Review whether the trend has broken before considering any staged plan."
+        position_advice = "High volatility or weakening trend requires position discipline."
+    elif is_held and trend_confirmed and risk_control_ok:
+        decision_stage = "hold_review"
+        next_action = "For held funds, review holding quality and position limit before adding capital."
+        position_advice = "Do not convert a high observation score into automatic position increase."
+    elif overheat and trend_confirmed:
+        decision_stage = "wait_for_pullback"
+        next_action = "Trend is strong but short-term heat is high; wait for pullback or calmer volume."
+        position_advice = "External candidates should remain in observation or very small staged research only."
+    elif buy_readiness_score >= 72 and risk_control_ok:
+        decision_stage = "staged_plan_candidate"
+        next_action = "Eligible for a staged-buy plan draft after rule checks; still no automatic execution."
+        position_advice = "Start from a light staged plan and recheck drawdown, volatility, and industry evidence."
+    elif context["isMeanReversion"] and not trend_confirmed:
+        decision_stage = "watch_only"
+        next_action = "Low valuation without trend confirmation should stay in observation."
+        position_advice = "Do not increase priority only because the fund looks cheap."
+    else:
+        decision_stage = "need_more_evidence"
+        next_action = "Keep tracking 1m/3m/6m trend, drawdown, volatility, and industry evidence."
+        position_advice = "Do not raise allocation priority before evidence improves."
+
+    if overheat:
+        buy_trigger = "Wait for a 5%-8% pullback from recent 1m heat while 3m trend remains positive."
+    elif buy_readiness_score >= 72 and risk_control_ok:
+        buy_trigger = "Only enter staged-plan research when trend is positive, not overheated, and risk metrics remain valid."
+    else:
+        buy_trigger = "Wait until observation score stabilizes above 72 with complete trend and risk evidence."
+
+    sell_trigger = "If 1m turns negative with 3m breakdown, or drawdown expands below -25%, pause additions and review risk."
+    if is_held:
+        sell_trigger = "For held funds, if medium-term trend weakens, drawdown breaches -25%, or position exceeds limit, prioritize control review."
+
+    return {
+        "decisionStage": decision_stage,
+        "buyReadinessScore": buy_readiness_score,
+        "nextAction": next_action,
+        "buyTrigger": buy_trigger,
+        "sellTrigger": sell_trigger,
+        "positionAdvice": position_advice,
+        "confidence": "high" if data_quality_ok and risk_control_ok else "medium" if data_quality_ok else "low",
+        "positionRatio": position_ratio,
+        "positionLimit": position_limit,
+        "checklist": [
+            f"1m return {fmt_percent_or_pending(return_1m)}; {'overheated, wait for pullback' if overheat else 'not overheated or missing data'}.",
+            f"3m/6m return {fmt_percent_or_pending(return_3m)} / {fmt_percent_or_pending(return_6m)}; {'trend confirmed' if trend_confirmed else 'trend still needs validation'}.",
+            f"max drawdown {fmt_percent_or_pending(max_drawdown)}; volatility {fmt_percent_or_pending(volatility)}; {'risk check passed' if risk_control_ok else 'risk or data quality needs review'}.",
+        ],
+    }
+
+
 def build_global_fund_picks(fund_rows: list[dict], portfolio_fund_rows: list[dict]) -> dict:
+    total_portfolio_value = sum(float(fund.get("market_value_snapshot") or 0) for fund in portfolio_fund_rows)
     unique_funds: dict[str, dict] = {}
     for fund in [*fund_rows, *portfolio_fund_rows]:
         key = fund_family_key(fund)
@@ -405,6 +800,7 @@ def build_global_fund_picks(fund_rows: list[dict], portfolio_fund_rows: list[dic
         score, action_label, reason, risk_note = global_observation_score(fund)
         if score < 48:
             continue
+        timing = global_decision_timing(fund, score, total_portfolio_value)
         ranked.append(
             {
                 "score": score,
@@ -413,20 +809,21 @@ def build_global_fund_picks(fund_rows: list[dict], portfolio_fund_rows: list[dic
                         fund,
                         score,
                         action_label,
-                        ["全局TOP候选", action_label, fund["fund_type"], fund["data_version"]],
+                        ["全局TOP候选", action_label, fund["fund_type"], public_data_tag(fund["data_version"])],
                     ),
                     "observationScore": score,
                     "actionLabel": action_label,
                     "reason": reason,
                     "riskNote": risk_note,
+                    "decisionTiming": timing,
                 },
             }
         )
 
     ranked.sort(key=lambda item: item["score"], reverse=True)
     return {
-        "title": "今日全局基金 TOP3 观察池",
-        "methodology": "从你的真实持仓和全部行业基金池合并去重后排序：优先比较已持有基金是否强于外部候选，再结合行业主线证据调节短期涨幅惩罚。AI、CPO、存储、半导体等强主线若中期趋势确认，不机械惩罚上涨；低位但趋势未确认的主题不因便宜自动入选。用于复盘和小仓观察，不构成买入建议。",
+        "title": "今日全局基金 TOP3 决策观察池",
+        "methodology": "从你的真实持仓和全部行业基金池合并去重后排序，并把观察分拆成买入节奏、卖出/控仓触发和下一步动作。强主线不机械惩罚上涨，但近1月过热会降级为等回调；低位但趋势未确认不会因为便宜自动入选。用于复盘、分批观察和仓位管理，不构成无条件买卖指令。",
         "items": [item["payload"] for item in ranked[:3]],
     }
 
@@ -450,28 +847,7 @@ def main() -> None:
         with get_connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 trade_date, data_version = resolve_industry_data_context(cur, trade_date)
-                cur.execute(
-                    """
-                    select
-                        iod.*,
-                        idm.performance_5d,
-                        idm.performance_20d,
-                        idm.performance_60d,
-                        idm.risk_score,
-                        idm.fund_count,
-                        im.industry_name
-                    from industry_opportunity_daily iod
-                    join industry_daily_metrics idm
-                      on idm.trade_date = iod.trade_date
-                     and idm.industry_id = iod.industry_id
-                     and idm.data_version = iod.data_version
-                    join industry_master im on im.industry_id = iod.industry_id
-                    where iod.trade_date = %s and iod.data_version = %s
-                    order by iod.opportunity_score desc
-                    """,
-                    (trade_date, data_version),
-                )
-                industries = cur.fetchall()
+                industries = load_industries_with_supplements(cur, trade_date, data_version)
 
                 cur.execute(
                     """
@@ -563,12 +939,29 @@ def main() -> None:
 
                 cur.execute(
                     """
-                    select industry_id, event_date, event_title, event_summary
-                    from industry_events_daily
-                    where trade_date = %s and data_version = %s
+                    with primary_events as (
+                        select industry_id, event_date, event_title, event_summary, priority_rank
+                        from industry_events_daily
+                        where trade_date = %s and data_version = %s
+                    ),
+                    fallback_events as (
+                        select industry_id, event_date, event_title, event_summary, priority_rank
+                        from industry_events_daily
+                        where trade_date <= %s and data_version = %s
+                    )
+                    select *
+                    from primary_events
+                    union all
+                    select *
+                    from fallback_events f
+                    where not exists (
+                        select 1
+                        from primary_events p
+                        where p.industry_id = f.industry_id
+                    )
                     order by priority_rank asc, event_date desc
                     """,
-                    (trade_date, data_version),
+                    (trade_date, data_version, trade_date, FALLBACK_DATA_VERSION),
                 )
                 events = cur.fetchall()
                 events_by_industry: dict[str, list[dict]] = {}
@@ -607,7 +1000,7 @@ def main() -> None:
                                 fund,
                                 score,
                                 signal,
-                                [f"行业第 {index}", signal, fund["fund_type"], fund["data_version"]],
+                                [f"行业第 {index}", signal, fund["fund_type"], public_data_tag(fund["data_version"])],
                             )
                         )
 
@@ -633,6 +1026,15 @@ def main() -> None:
                         }
                     )
 
+                    timeline_events = [
+                        {
+                            "date": event["event_date"].isoformat(),
+                            "title": event["event_title"],
+                            "summary": event["event_summary"],
+                        }
+                        for event in events_by_industry.get(row["industry_id"], [])
+                    ]
+                    long_term_events = build_long_term_events(row, events_by_industry.get(row["industry_id"], []))
                     detail_payload = {
                         "industryId": row["industry_id"],
                         "industryName": row["industry_name"],
@@ -651,20 +1053,17 @@ def main() -> None:
                         "riskMetrics": [
                             {"name": "拥挤度风险", "score": int(row["risk_score"] or 0), "summary": "风险分越高，越需要注意短期波动。"}
                         ],
-                        "timelineEvents": [
-                            {
-                                "date": event["event_date"].isoformat(),
-                                "title": event["event_title"],
-                                "summary": event["event_summary"],
-                            }
-                            for event in events_by_industry.get(row["industry_id"], [])
-                        ],
+                        "timelineEvents": timeline_events,
+                        "longTermEvents": long_term_events,
+                        "eventImpactSummary": build_event_impact_summary(row, long_term_events),
                         "chartSeries": [
                             {"label": "趋势", "value": int(row["trend_score"] or 0)},
                             {"label": "资金", "value": int(row["capital_score"] or 0)},
                             {"label": "估值", "value": int(row["valuation_score"] or 0)},
                             {"label": "机会", "value": int(row["opportunity_score"] or 0)},
                         ],
+                        "capitalHeatSeries": build_capital_heat_series(row),
+                        "methodologyNotes": methodology_notes(),
                         "relatedFunds": related_funds,
                         "trendStrategy": trend_strategy,
                         "disclaimer": "当前页面基于盘后快照生成，仅用于信息整理与观察，不构成投资建议。",
@@ -720,11 +1119,17 @@ def main() -> None:
                     processed_count += 1
 
                 for fund in fund_rows:
+                    return_3m = as_float_or_none(fund["return_3m"])
                     status_label = "持续关注"
-                    if float(fund["return_3m"] or 0) >= 15:
+                    if return_3m is not None and return_3m >= 15:
                         status_label = "强势跟踪"
-                    elif float(fund["return_3m"] or 0) >= 10:
+                    elif return_3m is not None and return_3m >= 10:
                         status_label = "趋势改善"
+                    latest_change = (
+                        f"{fund['fund_name']}近 3 月收益为 {return_3m:.1f}%，当前适合持续观察。"
+                        if return_3m is not None
+                        else f"{fund['fund_name']}近 3 月收益待补，当前仅保留观察，不按 0% 参与强弱判断。"
+                    )
 
                     cur.execute(
                         """
@@ -738,7 +1143,7 @@ def main() -> None:
                             trade_date,
                             fund["fund_id"],
                             status_label,
-                            f"{fund['fund_name']}近 3 月收益为 {float(fund['return_3m'] or 0):.1f}%，当前适合持续观察。",
+                            latest_change,
                             f"结合{fund['theme']}主题节奏，继续关注波动、回撤与跟踪说明的匹配度。",
                             batch_id,
                             data_version,

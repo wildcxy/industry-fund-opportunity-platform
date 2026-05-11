@@ -9,21 +9,32 @@ export function StorageActionButton({
   itemId,
   idleLabel,
   activeLabel,
-  maxItems
+  maxItems,
+  active: controlledActive,
+  onToggle
 }: {
   storageKey: string;
   itemId: string;
   idleLabel: string;
   activeLabel: string;
   maxItems?: number;
+  active?: boolean;
+  onToggle?: (itemId: string, nextActive: boolean) => void;
 }) {
   const [active, setActive] = useState(false);
+  const effectiveActive = controlledActive ?? active;
 
   useEffect(() => {
+    if (controlledActive !== undefined) return;
     setActive(readJsonArray(storageKey).includes(itemId));
-  }, [itemId, storageKey]);
+  }, [controlledActive, itemId, storageKey]);
 
   function toggle() {
+    if (onToggle) {
+      onToggle(itemId, !effectiveActive);
+      return;
+    }
+
     const current = readJsonArray(storageKey);
     if (current.includes(itemId)) {
       const next = current.filter((value) => value !== itemId);
@@ -42,10 +53,10 @@ export function StorageActionButton({
       type="button"
       onClick={toggle}
       className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
-        active ? "bg-pine text-white" : "bg-ink text-white hover:bg-pine"
+        effectiveActive ? "bg-pine text-white" : "bg-ink text-white hover:bg-pine"
       }`}
     >
-      {active ? activeLabel : idleLabel}
+      {effectiveActive ? activeLabel : idleLabel}
     </button>
   );
 }

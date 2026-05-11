@@ -7,6 +7,35 @@ export type ScoreLabel =
 
 export type RiskLevel = "低" | "中" | "高";
 
+export type PortfolioValuationStatus = "fresh" | "refreshing" | "stale" | "failed" | "unavailable" | "delayed";
+
+export type PortfolioValuationDataSource = "backend_cache" | "authorized_api" | "manual_import" | "mock" | "unavailable";
+
+export type PortfolioValuationSnapshot = {
+  snapshotId: string;
+  fundId: string;
+  fundCode?: string;
+  fundName: string;
+  holdingId?: string;
+  positionAmount?: number | null;
+  positionShare?: number | null;
+  holdingCostAmount?: number | null;
+  costNav?: number | null;
+  latestEstimatedNav?: number | null;
+  latestEstimatedPrice?: number | null;
+  valuationDate?: string;
+  currentEstimatedValue?: number | null;
+  estimatedProfit?: number | null; // Today's estimated profit/loss, not cumulative holding profit.
+  estimatedProfitPercent?: number | null; // Today's estimated return percent.
+  valuationUpdatedAt: string;
+  valuationStatus: PortfolioValuationStatus;
+  dataSource: PortfolioValuationDataSource;
+  delayReason?: string;
+  staleReason?: string;
+  errorMessage?: string;
+  isRealtime: false;
+};
+
 export type MetricExplain = {
   title: string;
   content: string;
@@ -58,6 +87,69 @@ export type TimelineEvent = {
   date: string;
   title: string;
   summary: string;
+};
+
+export type IndustryEventSourceType = "authorized_api" | "manual_import" | "internal_tag" | "mock";
+
+export type IndustryEventCategory =
+  | "ai_demand"
+  | "supply_chain"
+  | "capex_cycle"
+  | "overseas_demand"
+  | "valuation_overheat"
+  | "policy"
+  | "earnings"
+  | "short_term_noise"
+  | "other";
+
+export type IndustryEventImpactLabel =
+  | "long_term_support"
+  | "risk_or_invalidation"
+  | "short_term_noise"
+  | "mixed"
+  | "insufficient_evidence";
+
+export type IndustryLongTermEvent = {
+  eventId: string;
+  industryId: string;
+  industryName: string;
+  eventDate: string;
+  publishedAt: string;
+  sourceType: IndustryEventSourceType;
+  sourceName: string;
+  sourceUrl?: string;
+  title: string;
+  summary: string;
+  category: IndustryEventCategory;
+  longTermImpact: IndustryEventImpactLabel;
+  confidence: StrategyConfidence;
+  freshness: "fresh" | "watch" | "stale";
+  thesisEffect: string;
+  riskNote: string;
+  invalidationSignal?: string;
+};
+
+export type IndustryEventImpactSummary = {
+  industryId: string;
+  asOfDate: string;
+  supportCount: number;
+  riskCount: number;
+  shortTermNoiseCount: number;
+  confidence: StrategyConfidence;
+  impactDirection: IndustryEventImpactLabel;
+  supportingEvidence: string[];
+  weakeningEvidence: string[];
+  invalidationConditions: string[];
+  riskControlHint: string;
+  methodology: string;
+};
+
+export type IndustryEventMeta = {
+  eventCount: number;
+  sourceTypes: IndustryEventSourceType[];
+  freshness: Array<IndustryLongTermEvent["freshness"]>;
+  latestPublishedAt?: string;
+  sourceDescription: string;
 };
 
 export type ChartPoint = {
@@ -118,12 +210,12 @@ export type FundListItem = {
   themeAliases?: string[];
   trackingTarget: string;
   return1d?: number | null;
-  return1m: number;
-  return3m: number;
-  return6m: number;
-  maxDrawdown: number;
-  volatility: number;
-  aum: number;
+  return1m?: number | null;
+  return3m?: number | null;
+  return6m?: number | null;
+  maxDrawdown?: number | null;
+  volatility?: number | null;
+  aum?: number | null;
   latestNav?: number | null;
   previousNav?: number | null;
   latestNavDate?: string | null;
@@ -131,7 +223,7 @@ export type FundListItem = {
   metricTradeDate?: string | null;
   metricUpdatedAt?: string | null;
   metricDataVersion?: string | null;
-  feeRate: number;
+  feeRate?: number | null;
   tradableOnExchange: boolean;
   tags: string[];
   foundedYears?: number;
@@ -189,6 +281,8 @@ export type IndustryDetailSnapshot = {
   valuationMetrics: DetailMetric[];
   riskMetrics: DetailMetric[];
   timelineEvents: TimelineEvent[];
+  longTermEvents?: IndustryLongTermEvent[];
+  eventImpactSummary?: IndustryEventImpactSummary;
   chartSeries: ChartPoint[];
   relatedFunds: FundListItem[];
   disclaimer: string;
@@ -199,20 +293,20 @@ export type FundCompareItem = {
   fundName: string;
   fundCode: string;
   returnMetrics: {
-    day1?: number;
-    month1: number;
-    month3: number;
-    month6: number;
-    latestNav?: number;
-    previousNav?: number;
+    day1?: number | null;
+    month1?: number | null;
+    month3?: number | null;
+    month6?: number | null;
+    latestNav?: number | null;
+    previousNav?: number | null;
   };
   riskMetrics: {
-    maxDrawdown: number;
-    volatility: number;
+    maxDrawdown?: number | null;
+    volatility?: number | null;
   };
-  feeRate: number;
-  aum: number;
-  inceptionDate: string;
+  feeRate?: number | null;
+  aum?: number | null;
+  inceptionDate?: string | null;
   topHoldings: string[];
   concentration: string;
   trackingDeviationNote: string;
@@ -381,6 +475,16 @@ export type PortfolioStrategyReviewItem = {
   buyWatchScore?: number | null;
   operationReason?: string;
   operationDisclaimer?: string;
+  portfolioRating?: "Buy" | "Overweight" | "Hold" | "Underweight" | "Sell" | string;
+  portfolioRatingLabel?: string;
+  positionLimit?: number | null;
+  riskVetoes?: string[];
+  decisionCommittee?: {
+    aggressiveCase?: string;
+    neutralCase?: string;
+    conservativeCase?: string;
+    finalView?: string;
+  };
   evidenceSummary?: string[];
   missingEvidence?: string[];
   industryContext?: PortfolioIndustryEvidence | null;
@@ -404,6 +508,361 @@ export type PortfolioIndustryEvidence = {
   evidenceStatus?: string;
 };
 
+export type FundScoreState = "observe" | "staged_buy_candidate" | "hold" | "avoid" | "remove";
+
+export type StrategyConfidence = "low" | "medium" | "high";
+
+export type FundScoreComponents = {
+  industryOpportunity: number;
+  fundQuality: number;
+  timing: number;
+  riskAdjusted: number;
+  dataConfidence: number;
+  portfolioFit: number;
+};
+
+export type FundScore = {
+  fundId: string;
+  fundCode?: string;
+  fundName: string;
+  scoreDate: string;
+  totalScore: number;
+  state: FundScoreState;
+  components: FundScoreComponents;
+  reasons: string[];
+  weaknesses: string[];
+  riskVetoes: string[];
+  confidence: StrategyConfidence;
+  nextAction: string;
+  methodology: string;
+};
+
+export type BuyPlanStatus = "draft" | "active" | "paused" | "completed" | "cancelled";
+
+export type BuyPlanBatchStatus = "pending" | "ready_for_system_plan" | "done" | "skipped";
+
+export type BuyPlanBatch = {
+  batchIndex: number;
+  trigger: string;
+  plannedExposurePercent: number;
+  status: BuyPlanBatchStatus;
+};
+
+export type BuyPlan = {
+  planId: string;
+  fundId: string;
+  fundCode?: string;
+  fundName: string;
+  createdAt: string;
+  status: BuyPlanStatus;
+  maxPlannedExposurePercent: number;
+  batchCount: number;
+  batches: BuyPlanBatch[];
+  pauseConditions: string[];
+  invalidationConditions: string[];
+  reviewDate?: string;
+  notes?: string;
+};
+
+export type PostBuyReviewDecision = "continue_observe" | "pause_buying" | "remove_from_pool" | "revise_plan";
+
+export type PostBuyReviewRiskEvent = {
+  eventId: string;
+  eventDate: string;
+  severity: "low" | "medium" | "high";
+  category: "drawdown" | "volatility" | "concentration" | "data_quality" | "thesis_drift" | "overheat" | "other";
+  summary: string;
+  riskControl: string;
+};
+
+export type PostBuyReview = {
+  reviewId: string;
+  fundId: string;
+  fundCode?: string;
+  fundName: string;
+  buyPlanId?: string;
+  reviewDate: string;
+  manualBuyDate?: string;
+  originalThesis: {
+    summary: string;
+    evidence: string[];
+    invalidationConditions: string[];
+  };
+  actualOutcome: {
+    summary: string;
+    returnSinceManualBuyPercent?: number | null;
+    maxDrawdownSinceManualBuyPercent?: number | null;
+    thesisStillValid: boolean;
+    evidence: string[];
+  };
+  riskEvents: PostBuyReviewRiskEvent[];
+  decision: PostBuyReviewDecision;
+  nextAction: string;
+  notes?: string;
+};
+
+export type RiskAssessmentLevel = "low" | "medium" | "high";
+
+export type RiskDataQuality = "complete" | "partial" | "snapshot_only" | "stale";
+
+export type RiskAssessment = {
+  fundId: string;
+  fundCode?: string;
+  fundName: string;
+  riskLevel: RiskAssessmentLevel;
+  vetoes: string[];
+  warnings: string[];
+  pauseConditions: string[];
+  invalidationConditions: string[];
+  dataQuality: RiskDataQuality;
+  nextReviewDate?: string;
+};
+
+export type AiEvidenceSourceType = "authorized_api" | "official_announcement" | "fund_report" | "manual_import" | "internal_tag" | "mock";
+
+export type AiEvidenceImpactDirection = "support" | "risk" | "invalidation" | "mixed" | "short_term_noise" | "insufficient_evidence";
+
+export type AiEvidenceStatus = "interpreted" | "ai_pending_review" | "ai_interpretation_failed" | "source_unavailable" | "stale_source" | "low_confidence";
+
+export type AiEvidenceRiskSignalCode =
+  | "fund_manager_change"
+  | "style_drift"
+  | "scale_anomaly"
+  | "holding_concentration"
+  | "fee_change"
+  | "policy_uncertainty"
+  | "valuation_overheat"
+  | "data_quality"
+  | "thesis_invalidation"
+  | "other";
+
+export type AiEvidenceRiskSignal = {
+  code: AiEvidenceRiskSignalCode;
+  severity: "low" | "medium" | "high";
+  message: string;
+};
+
+export type AiSourceDocument = {
+  schemaVersion: "ai-source-document-v1";
+  sourceDocumentId: string;
+  sourceType: AiEvidenceSourceType;
+  sourceName: string;
+  sourceUrl?: string;
+  title: string;
+  publishedAt: string;
+  ingestedAt: string;
+  contentHash?: string;
+  copyrightBoundary: "authorized" | "user_provided" | "internal" | "mock";
+  rawTextStorage: "not_stored" | "stored_snapshot" | "stored_reference_only";
+};
+
+export type AiEvidenceItem = {
+  schemaVersion: "ai-evidence-v1";
+  evidenceId: string;
+  sourceDocumentId: string;
+  sourceType: AiEvidenceSourceType;
+  sourceName: string;
+  sourceUrl?: string;
+  publishedAt: string;
+  ingestedAt: string;
+  relatedFundIds: string[];
+  relatedFundCodes?: string[];
+  relatedIndustryIds: string[];
+  relatedRecommendationId?: string;
+  relatedSystemConclusionId?: string;
+  eventType:
+    | "supportive_announcement"
+    | "negative_fund_report"
+    | "policy_uncertainty"
+    | "fund_manager_change"
+    | "scale_anomaly"
+    | "holding_style_drift"
+    | "fee_change"
+    | "conflicting_news"
+    | "industry_news"
+    | "other";
+  displaySummary: string;
+  extractedFacts: string[];
+  impactDirection: AiEvidenceImpactDirection;
+  confidence: "low" | "medium" | "high";
+  uncertainty: string;
+  riskSignals: AiEvidenceRiskSignal[];
+  thesisEffect: string;
+  evidenceStatus: AiEvidenceStatus;
+  requiresSystemEvidenceReview: boolean;
+  conflictGroupId?: string;
+  conflictStatus?: "none" | "supports_existing_thesis" | "conflicts_with_existing_thesis" | "unresolved_conflict";
+  sourceFreshness: "fresh" | "watch" | "stale";
+  modelName?: string;
+  promptVersion?: string;
+  generatedAt?: string;
+  mockOnly?: boolean;
+};
+
+export type WatchlistStrategyStage = "watching" | "scoring" | "buy_plan_draft" | "paused" | "removed";
+
+export type WatchlistStrategyRiskLevel = "low" | "medium" | "high";
+
+export type WatchlistStrategyConfidence = StrategyConfidence;
+
+export type WatchlistMissingEvidenceReason =
+  | "fetch_failed"
+  | "source_unavailable"
+  | "stale_data"
+  | "manual_needed"
+  | "not_applicable";
+
+export type WatchlistStrategyMissingEvidence = {
+  code: WatchlistMissingEvidenceReason;
+  field: string;
+  message: string;
+  impact: string;
+  suggestedAction: string;
+  source?: string;
+  updatedAt?: string;
+};
+
+export type ManualStrategyAssumptionTargetType = "fund" | "industry";
+
+export type ManualStrategyAssumption = {
+  assumptionId: string;
+  source: "user";
+  targetType: ManualStrategyAssumptionTargetType;
+  fundId?: string;
+  fundCode?: string;
+  fundName?: string;
+  industryId?: string;
+  industryName?: string;
+  thesisTitle: string;
+  hypothesis: string;
+  evidenceSourceNote: string;
+  confidence: StrategyConfidence;
+  invalidationCondition: string;
+  nextReviewDate?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type WatchlistStrategyManualAssumptionRef = {
+  assumptionId: string;
+  source: "user";
+  targetType?: ManualStrategyAssumptionTargetType;
+  fundId?: string;
+  fundCode?: string;
+  industryId?: string;
+  thesisTitle?: string;
+  evidenceSourceNote?: string;
+  nextReviewDate?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  hypothesis: string;
+  confidence: StrategyConfidence;
+  appliesWhen?: string;
+  invalidationCondition: string;
+  evidenceRefs?: string[];
+};
+
+export type WatchlistStrategyBacktestSummary = {
+  sampleStartDate: string;
+  sampleEndDate: string;
+  benchmark: string;
+  feeAssumption: string;
+  returnPercent?: number | null;
+  benchmarkReturnPercent?: number | null;
+  excessReturnPercent?: number | null;
+  maxDrawdownPercent?: number | null;
+  volatilityPercent?: number | null;
+  winPeriods?: number | null;
+  lossPeriods?: number | null;
+  sampleSize?: number | null;
+  overfitRisk: "low" | "medium" | "high";
+  limitations: string[];
+  conclusion: string;
+  methodology?: string;
+};
+
+export type WatchlistStrategyBacktestSeriesPoint = {
+  date: string;
+  nav?: number | null;
+  returnPercent?: number | null;
+};
+
+export type BuildWatchlistStrategyBacktestSummaryInput = {
+  strategyName?: string;
+  series: WatchlistStrategyBacktestSeriesPoint[];
+  benchmarkSeries?: WatchlistStrategyBacktestSeriesPoint[];
+  benchmark: string;
+  feeAssumption: string;
+  feePercent?: number | null;
+  slippagePercent?: number | null;
+  minSampleSize?: number;
+  parameterCount?: number;
+  periodsPerYear?: number;
+  asOfDate?: string;
+};
+
+export type SystemStrategyConclusionResult =
+  | "system_plan_draft_ready"
+  | "system_watch_continue"
+  | "system_risk_blocked"
+  | "system_need_more_evidence";
+
+export type SystemStrategyConclusionRuleCheck = {
+  ruleId: string;
+  label: string;
+  passed: boolean;
+  message: string;
+};
+
+export type SystemStrategyConclusion = {
+  conclusionId: string;
+  fundId: string;
+  fundCode?: string;
+  fundName: string;
+  relatedRecommendationId?: string;
+  relatedAiEvidenceIds: string[];
+  relatedRiskAssessmentId?: string;
+  relatedPortfolioValuationId?: string;
+  relatedBuyPlanDraftId?: string;
+  conclusionTime: string;
+  conclusionResult: SystemStrategyConclusionResult;
+  recommendationReason: string;
+  coreEvidence: string[];
+  triggeredRules: SystemStrategyConclusionRuleCheck[];
+  riskVetoes: string[];
+  dataQuality: RiskDataQuality;
+  valuationStatus?: PortfolioValuationStatus;
+  estimatedValue?: number | null;
+  estimatedProfit?: number | null;
+  valuationUpdatedAt?: string;
+  portfolioConcentrationSummary?: string;
+  planLimitSummary?: string;
+  pauseConditions: string[];
+  invalidationConditions: string[];
+  dataSnapshotSummary: string;
+  nextSystemReviewDate?: string;
+  note?: string;
+};
+
+export type WatchlistStrategyState = {
+  stage: WatchlistStrategyStage;
+  strategyScore?: number | null;
+  riskLevel?: WatchlistStrategyRiskLevel | null;
+  riskVetoes?: string[];
+  nextAction?: string;
+  nextReviewDate?: string;
+  buyPlanDraftId?: string;
+  reason?: string;
+  confidence?: WatchlistStrategyConfidence;
+  missingEvidence?: WatchlistStrategyMissingEvidence[];
+  manualAssumptionRefs?: WatchlistStrategyManualAssumptionRef[];
+  backtestSummary?: WatchlistStrategyBacktestSummary;
+  aiEvidenceRefs?: AiEvidenceItem[];
+  systemConclusionResult?: SystemStrategyConclusionResult;
+  systemConclusion?: SystemStrategyConclusion;
+  updatedAt?: string;
+};
+
 export type WatchlistItem = {
   itemId: string;
   itemType: "industry" | "fund";
@@ -413,6 +872,9 @@ export type WatchlistItem = {
   latestChange: string;
   updatedAt: string;
   entryLink: string;
+  strategyState?: WatchlistStrategyState;
+  industryEventSummary?: IndustryEventImpactSummary;
+  industryEventMeta?: IndustryEventMeta;
 };
 
 export type IndustryHomepageView = IndustryOpportunityCard & {
@@ -432,6 +894,18 @@ export type GlobalFundPick = FundListItem & {
   actionLabel: string;
   reason: string;
   riskNote: string;
+  decisionTiming?: {
+    decisionStage: string;
+    buyReadinessScore: number;
+    nextAction: string;
+    buyTrigger: string;
+    sellTrigger: string;
+    positionAdvice: string;
+    confidence: "low" | "medium" | "high" | string;
+    positionRatio?: number;
+    positionLimit?: number;
+    checklist: string[];
+  };
   isHeld?: boolean;
   marketValueSnapshot?: number;
   holdingReturnSnapshot?: number;

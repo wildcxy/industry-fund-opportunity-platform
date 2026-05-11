@@ -6,6 +6,7 @@ import { ScorePill } from "@/components/score-pill";
 import { StorageActionButton } from "@/components/storage-action-button";
 import { TrendBars } from "@/components/trend-bars";
 import { WatchlistPanel } from "@/components/watchlist-panel";
+import { IndustryNewsEventRefreshButton } from "@/features/industries/industry-news-event-refresh-button";
 import { IndustryTopFundRefreshButton } from "@/features/industries/industry-top-fund-refresh-button";
 import { getHomepageIndustryView } from "@/lib/adapters/industry";
 import { formatPercent, formatRate } from "@/lib/format";
@@ -47,7 +48,10 @@ export default async function HomePage() {
         </div>
       </section>
 
-      <IndustryTopFundRefreshButton />
+      <section className="grid gap-4 xl:grid-cols-2">
+        <IndustryTopFundRefreshButton />
+        <IndustryNewsEventRefreshButton />
+      </section>
 
       <section className="grid gap-6 md:grid-cols-3">
         <div className="metric-card">
@@ -111,10 +115,52 @@ export default async function HomePage() {
                   </div>
                 ) : null}
                 <div className="mt-4 rounded-2xl bg-white p-4">
-                  <p className="text-sm font-semibold text-pine">{fund.actionLabel}</p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-sm font-semibold text-pine">{fund.actionLabel}</p>
+                    {fund.decisionTiming ? (
+                      <span className="rounded-full bg-mist px-3 py-1 text-xs font-semibold text-ink">
+                        {fund.decisionTiming.decisionStage}
+                      </span>
+                    ) : null}
+                  </div>
                   <p className="mt-2 text-sm leading-6 text-ink/68">{fund.reason}</p>
                   <p className="mt-2 text-xs leading-5 text-ink/50">{fund.riskNote}</p>
                 </div>
+                {fund.decisionTiming ? (
+                  <div className="mt-4 rounded-2xl bg-ink p-4 text-white">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-white/55">Next Action</p>
+                        <p className="mt-2 text-sm font-semibold">{fund.decisionTiming.nextAction}</p>
+                      </div>
+                      <div className="rounded-xl bg-white/10 px-3 py-2 text-right">
+                        <p className="text-xs text-white/60">买入准备</p>
+                        <p className="text-lg font-semibold">{fund.decisionTiming.buyReadinessScore}</p>
+                      </div>
+                    </div>
+                    <div className="mt-4 space-y-2 text-xs leading-5 text-white/72">
+                      <p>
+                        <span className="font-semibold text-white">买入触发：</span>
+                        {fund.decisionTiming.buyTrigger}
+                      </p>
+                      <p>
+                        <span className="font-semibold text-white">卖出/控仓：</span>
+                        {fund.decisionTiming.sellTrigger}
+                      </p>
+                      <p>
+                        <span className="font-semibold text-white">仓位建议：</span>
+                        {fund.decisionTiming.positionAdvice}
+                      </p>
+                    </div>
+                    <div className="mt-4 space-y-2">
+                      {fund.decisionTiming.checklist.slice(0, 3).map((item) => (
+                        <p key={item} className="rounded-xl bg-white/8 px-3 py-2 text-xs leading-5 text-white/70">
+                          {item}
+                        </p>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
                 <div className="mt-4 grid grid-cols-3 gap-2 text-sm">
                   <div className="rounded-2xl bg-white p-3">
                     <p className="text-xs text-ink/50">近1月</p>

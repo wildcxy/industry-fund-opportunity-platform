@@ -1,6 +1,7 @@
 from datetime import date
 
 from psycopg.types.json import Jsonb
+from psycopg.rows import dict_row
 
 from db.connection import get_connection
 from db.queries.fund_candidates import (
@@ -16,6 +17,51 @@ DATA_VERSION = "akshare-user-v1"
 TUSHARE_DATA_VERSION = "tushare-user-v1"
 SELF_SELECTED_INDUSTRY_ID = "self-selected"
 SELF_SELECTED_INDUSTRY_NAME = "自选基金"
+
+
+def _float_or_none(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def get_cached_single_fund_collection(fund_code: str, trade_date: date) -> dict | None:
+    normalized = normalize_fund_code(fund_code)
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                select
+                    fm.fund_id,
+                    fm.fund_code,
+                    fm.fund_name,
+                    fdm.trade_date,
+                    fdm.data_version,
+                    fdm.updated_at
+                from fund_master fm
+                join fund_daily_metrics fdm on fdm.fund_id = fm.fund_id
+                where fm.fund_code = %s
+                  and fdm.trade_date >= %s
+                order by fdm.trade_date desc, fdm.updated_at desc
+                limit 1
+                """,
+                (normalized, trade_date),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "fundId": row["fund_id"],
+        "fundCode": row["fund_code"],
+        "fundName": row["fund_name"],
+        "tradeDate": row["trade_date"].isoformat() if row["trade_date"] else None,
+        "dataVersion": row["data_version"],
+        "sourceName": "db-cache",
+        "cacheStatus": "hit",
+        "updatedAt": row["updated_at"].isoformat() if row["updated_at"] else None,
+    }
 
 
 def collect_single_fund(fund_code: str, trade_date: date, provider: AKShareFundProvider | None = None) -> dict:
@@ -290,18 +336,18 @@ def _upsert_fund_compare_daily(
             master["fund_id"],
             Jsonb(
                 {
-                    "day1": float(daily["return_1d"] or 0),
-                    "month1": float(daily["return_1m"] or 0),
-                    "month3": float(daily["return_3m"] or 0),
-                    "month6": float(daily["return_6m"] or 0),
-                    "latestNav": float(daily["latest_nav"] or 0),
-                    "previousNav": float(daily["previous_nav"] or 0),
+                    "day1": _float_or_none(daily["return_1d"]),
+                    "month1": _float_or_none(daily["return_1m"]),
+                    "month3": _float_or_none(daily["return_3m"]),
+                    "month6": _float_or_none(daily["return_6m"]),
+                    "latestNav": _float_or_none(daily["latest_nav"]),
+                    "previousNav": _float_or_none(daily["previous_nav"]),
                 }
             ),
             Jsonb(
                 {
-                    "maxDrawdown": float(daily["max_drawdown"] or 0),
-                    "volatility": float(daily["volatility"] or 0),
+                    "maxDrawdown": _float_or_none(daily["max_drawdown"]),
+                    "volatility": _float_or_none(daily["volatility"]),
                 }
             ),
             master["fee_rate"],

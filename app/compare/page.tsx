@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import { RiskDisclaimer } from "@/components/risk-disclaimer";
+import { isDemoMode } from "@/lib/data-mode";
 import { formatRate } from "@/lib/format";
 import { STORAGE_KEYS, readCompareItems, readJsonArray, writeJsonArray } from "@/lib/storage";
 import { FundCompareItem, HoldingCostScenario } from "@/types";
@@ -55,7 +56,7 @@ export default function ComparePage() {
         }
       } catch {
         if (!cancelled) {
-          setRows(readCompareItems());
+          setRows(isDemoMode() ? readCompareItems() : []);
           setLoading(false);
         }
       }

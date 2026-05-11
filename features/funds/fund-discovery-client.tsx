@@ -2,17 +2,18 @@
 
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 
 import { StorageActionButton } from "@/components/storage-action-button";
 import { formatAum, formatPercent, formatRate } from "@/lib/format";
 import { buildShortTermReview } from "@/lib/fund-review";
-import { STORAGE_KEYS } from "@/lib/storage";
-import { FundDiscoveryQueryState, FundHoldingView, FundListItem, FundSearchResult } from "@/types";
+import { readJsonArray, readWatchlistStrategyStateMap, STORAGE_KEYS, writeJsonArray } from "@/lib/storage";
+import { FundDiscoveryQueryState, FundHoldingView, FundListItem, FundSearchResult, WatchlistStrategyState } from "@/types";
 
 type SearchState = "idle" | "loading" | "error" | "ready";
 type ActionState = Record<string, "adding" | "collecting" | "done" | "error">;
 type HoldingState = Record<string, { loading: boolean; data?: FundHoldingView; error?: string }>;
+type StrategyStateByFundId = Record<string, WatchlistStrategyState | undefined>;
 
 function toQueryString(state: FundDiscoveryQueryState) {
   const params = new URLSearchParams();
@@ -33,18 +34,20 @@ function toQueryString(state: FundDiscoveryQueryState) {
 
 function inFeeBand(fund: FundListItem, feeBand: FundDiscoveryQueryState["feeBand"]) {
   if (feeBand === "全部") return true;
-  if (!fund.feeRuleSummary && fund.feeRate === 0) return false;
-  if (feeBand === "低费率") return fund.feeRate <= 0.5;
-  if (feeBand === "中费率") return fund.feeRate > 0.5 && fund.feeRate <= 0.8;
-  return fund.feeRate > 0.8;
+  const feeRate = fund.feeRuleSummary?.purchaseFeeRate ?? fund.feeRuleSummary?.subscriptionFeeRate ?? fund.feeRate;
+  if (feeRate === null || feeRate === undefined || !Number.isFinite(feeRate)) return false;
+  if (feeBand === "低费率") return feeRate <= 0.5;
+  if (feeBand === "中费率") return feeRate > 0.5 && feeRate <= 0.8;
+  return feeRate > 0.8;
 }
 
 function inAumBand(fund: FundListItem, aumBand: FundDiscoveryQueryState["aumBand"]) {
   if (aumBand === "全部") return true;
-  if (!hasMetric(fund, "aum")) return false;
-  if (aumBand === "10亿以下") return fund.aum < 10;
-  if (aumBand === "10-50亿") return fund.aum >= 10 && fund.aum <= 50;
-  return fund.aum > 50;
+  const aum = fund.aum;
+  if (!hasMetric(fund, "aum") || aum === null || aum === undefined) return false;
+  if (aumBand === "10亿以下") return aum < 10;
+  if (aumBand === "10-50亿") return aum >= 10 && aum <= 50;
+  return aum > 50;
 }
 
 function inAgeBand(fund: FundListItem, ageBand: FundDiscoveryQueryState["ageBand"]) {
@@ -58,10 +61,11 @@ function inAgeBand(fund: FundListItem, ageBand: FundDiscoveryQueryState["ageBand
 
 function inVolatilityBand(fund: FundListItem, volatilityBand: FundDiscoveryQueryState["volatilityBand"]) {
   if (volatilityBand === "全部") return true;
-  if (!hasMetric(fund, "volatility")) return false;
-  if (volatilityBand === "低波动") return fund.volatility < 20;
-  if (volatilityBand === "中波动") return fund.volatility >= 20 && fund.volatility <= 25;
-  return fund.volatility > 25;
+  const volatility = fund.volatility;
+  if (!hasMetric(fund, "volatility") || volatility === null || volatility === undefined) return false;
+  if (volatilityBand === "低波动") return volatility < 20;
+  if (volatilityBand === "中波动") return volatility >= 20 && volatility <= 25;
+  return volatility > 25;
 }
 
 function getHoldingCost(fund: FundListItem, holdingDays: number) {
@@ -79,7 +83,8 @@ function formatFundPercent(fund: FundListItem, metric: "return1d" | "return1m" |
 }
 
 function formatFundAum(fund: FundListItem) {
-  return hasMetric(fund, "aum") && fund.aum > 0 ? formatAum(fund.aum) : "--";
+  const aum = fund.aum;
+  return hasMetric(fund, "aum") && aum !== null && aum !== undefined && aum > 0 ? formatAum(aum) : "--";
 }
 
 function getDataSourceTone(source?: FundListItem["dataSource"]) {
@@ -105,8 +110,9 @@ function getSearchStatusLabel(item: FundSearchResult, action?: ActionState[strin
 function getThemeSignals(funds: FundListItem[]) {
   const grouped = new Map<string, number[]>();
   funds.forEach((fund) => {
-    if (!hasMetric(fund, "return3m")) return;
-    grouped.set(fund.theme, [...(grouped.get(fund.theme) ?? []), fund.return3m]);
+    const return3m = fund.return3m;
+    if (!hasMetric(fund, "return3m") || return3m === null || return3m === undefined) return;
+    grouped.set(fund.theme, [...(grouped.get(fund.theme) ?? []), return3m]);
   });
 
   const signals = new Map<string, { label: string; tone: string }>();
@@ -136,27 +142,33 @@ function getFundSignals(fund: FundListItem, themeSignal?: { label: string; tone:
   if (shortTermReview.level !== "low") {
     signals.push({ label: shortTermReview.badgeLabel, tone: shortTermReview.toneClass });
   }
-  if (hasMetric(fund, "return1m") && fund.return1m >= 5) {
+  if (hasMetric(fund, "return1m") && fund.return1m !== null && fund.return1m !== undefined && fund.return1m >= 5) {
     signals.push({ label: "近1月强势", tone: "bg-emerald-50 text-emerald-700" });
   }
-  if (hasMetric(fund, "return3m") && fund.return3m >= 10) {
+  if (hasMetric(fund, "return3m") && fund.return3m !== null && fund.return3m !== undefined && fund.return3m >= 10) {
     signals.push({ label: "近3月强势", tone: "bg-emerald-50 text-emerald-700" });
   }
   if (
     hasMetric(fund, "return3m") &&
     hasMetric(fund, "maxDrawdown") &&
     hasMetric(fund, "aum") &&
+    fund.return3m !== null &&
+    fund.return3m !== undefined &&
+    fund.maxDrawdown !== null &&
+    fund.maxDrawdown !== undefined &&
+    fund.aum !== null &&
+    fund.aum !== undefined &&
     fund.return3m > -5 &&
     fund.maxDrawdown > -18 &&
     fund.aum >= 1 &&
-    fund.feeRate <= 0.8
+    (fund.feeRate ?? Number.POSITIVE_INFINITY) <= 0.8
   ) {
     signals.push({ label: "长期候选", tone: "bg-teal-50 text-teal-700" });
   }
-  if (hasMetric(fund, "maxDrawdown") && fund.maxDrawdown <= -20) {
+  if (hasMetric(fund, "maxDrawdown") && fund.maxDrawdown !== null && fund.maxDrawdown !== undefined && fund.maxDrawdown <= -20) {
     signals.push({ label: "回撤较深", tone: "bg-rose-50 text-rose-700" });
   }
-  if (hasMetric(fund, "aum") && fund.aum > 0 && fund.aum < 1) {
+  if (hasMetric(fund, "aum") && fund.aum !== null && fund.aum !== undefined && fund.aum > 0 && fund.aum < 1) {
     signals.push({ label: "规模偏小", tone: "bg-amber-50 text-amber-700" });
   }
   if (!fund.feeRuleSummary && fund.dataSource !== "演示样例") {
@@ -171,10 +183,11 @@ function getFundSignals(fund: FundListItem, themeSignal?: { label: string; tone:
 
 function sortableValue(fund: FundListItem, key: FundDiscoveryQueryState["sortKey"]) {
   if (key === "feeRate") {
-    return fund.feeRuleSummary || fund.feeRate > 0 ? fund.feeRate : Number.POSITIVE_INFINITY;
+    const feeRate = fund.feeRuleSummary?.purchaseFeeRate ?? fund.feeRuleSummary?.subscriptionFeeRate ?? fund.feeRate;
+    return feeRate !== null && feeRate !== undefined && Number.isFinite(feeRate) ? feeRate : Number.POSITIVE_INFINITY;
   }
-  if (key === "aum") return hasMetric(fund, "aum") ? fund.aum : Number.NEGATIVE_INFINITY;
-  if (key === "maxDrawdown") return hasMetric(fund, "maxDrawdown") ? fund.maxDrawdown : Number.NEGATIVE_INFINITY;
+  if (key === "aum") return hasMetric(fund, "aum") && fund.aum !== null && fund.aum !== undefined ? fund.aum : Number.NEGATIVE_INFINITY;
+  if (key === "maxDrawdown") return hasMetric(fund, "maxDrawdown") && fund.maxDrawdown !== null && fund.maxDrawdown !== undefined ? fund.maxDrawdown : Number.NEGATIVE_INFINITY;
   const value = fund[key];
   return hasMetric(fund, key) && value !== null && value !== undefined ? value : Number.NEGATIVE_INFINITY;
 }
@@ -183,29 +196,62 @@ function getFundObservationText(fund: FundListItem) {
   if (fund.dataCompleteness === "pending") return "已加入候选池，等待采集真实净值与风险收益指标。";
   if (fund.dataCompleteness === "failed") return "最近一次采集失败，建议重新触发采集或稍后重试。";
   if (fund.dataCompleteness === "partial") return "已有部分真实指标，但仍有字段缺失；适合先观察，不适合直接比较成本。";
-  if (hasMetric(fund, "return3m") && fund.return3m >= 10) return "短期表现较强，适合高亮观察，但需要结合回撤、估值和拥挤度判断。";
-  if (hasMetric(fund, "maxDrawdown") && fund.maxDrawdown <= -20) return "回撤较深，可能存在左侧观察价值，也可能代表趋势仍弱，需要结合行业基本面。";
+  if (hasMetric(fund, "return3m") && fund.return3m !== null && fund.return3m !== undefined && fund.return3m >= 10) return "短期表现较强，适合高亮观察，但需要结合回撤、估值和拥挤度判断。";
+  if (hasMetric(fund, "maxDrawdown") && fund.maxDrawdown !== null && fund.maxDrawdown !== undefined && fund.maxDrawdown <= -20) return "回撤较深，可能存在左侧观察价值，也可能代表趋势仍弱，需要结合行业基本面。";
   return fund.feeRuleSummary?.feeRuleText ?? "用于长期观察时，应同时比较费率、回撤、波动、规模和主题代表性。";
 }
 
+function getStrategyStageLabel(state?: WatchlistStrategyState) {
+  if (!state) return "未进入策略状态";
+  if (state.stage === "watching") return "普通观察";
+  if (state.stage === "scoring") return "评分中";
+  if (state.stage === "buy_plan_draft") return "计划草稿";
+  if (state.stage === "paused") return "暂停观察";
+  return "移出池";
+}
+
+function getStrategyStageTone(state?: WatchlistStrategyState) {
+  if (!state) return "bg-mist text-ink/65";
+  if (state.stage === "buy_plan_draft") return "bg-teal-50 text-teal-700";
+  if (state.stage === "paused" || state.stage === "removed") return "bg-rose-50 text-rose-700";
+  if (state.stage === "scoring") return "bg-amber-50 text-amber-700";
+  return "bg-sky-50 text-sky-700";
+}
+
 function getVisibleEstimate(funds: FundListItem[]) {
-  const withDayReturn = funds.filter((fund) => hasMetric(fund, "return1d") && fund.return1d !== null && fund.return1d !== undefined);
-  const average = withDayReturn.length ? withDayReturn.reduce((sum, fund) => sum + (fund.return1d ?? 0), 0) / withDayReturn.length : null;
-  const risingCount = withDayReturn.filter((fund) => (fund.return1d ?? 0) > 0).length;
-  const fallingCount = withDayReturn.filter((fund) => (fund.return1d ?? 0) < 0).length;
-  const strongest = [...withDayReturn].sort((left, right) => (right.return1d ?? 0) - (left.return1d ?? 0))[0];
-  const weakest = [...withDayReturn].sort((left, right) => (left.return1d ?? 0) - (right.return1d ?? 0))[0];
-  const navDates = withDayReturn
-    .map((fund) => fund.latestNavDate ?? fund.metricTradeDate)
-    .filter((value): value is string => Boolean(value));
-  const uniqueDates = [...new Set(navDates)].sort();
+  let count = 0;
+  let sum = 0;
+  let risingCount = 0;
+  let fallingCount = 0;
+  let strongest: FundListItem | undefined;
+  let weakest: FundListItem | undefined;
+  const navDateSet = new Set<string>();
+
+  funds.forEach((fund) => {
+    if (!hasMetric(fund, "return1d") || fund.return1d === null || fund.return1d === undefined) return;
+    count += 1;
+    sum += fund.return1d;
+    if (fund.return1d > 0) risingCount += 1;
+    if (fund.return1d < 0) fallingCount += 1;
+    if (!strongest || fund.return1d > (strongest.return1d ?? Number.NEGATIVE_INFINITY)) {
+      strongest = fund;
+    }
+    if (!weakest || fund.return1d < (weakest.return1d ?? Number.POSITIVE_INFINITY)) {
+      weakest = fund;
+    }
+    const navDate = fund.latestNavDate ?? fund.metricTradeDate;
+    if (navDate) navDateSet.add(navDate);
+  });
+
+  const average = count ? sum / count : null;
+  const uniqueDates = Array.from(navDateSet).sort();
   const latestDate = uniqueDates.at(-1) ?? null;
   const earliestDate = uniqueDates[0] ?? null;
   const dateLabel = latestDate ? (earliestDate && earliestDate !== latestDate ? `${earliestDate} 至 ${latestDate}` : latestDate) : "暂无披露日期";
 
   return {
     average,
-    coverage: funds.length ? Math.round((withDayReturn.length / funds.length) * 100) : 0,
+    coverage: funds.length ? Math.round((count / funds.length) * 100) : 0,
     risingCount,
     fallingCount,
     strongest,
@@ -238,6 +284,36 @@ export function FundDiscoveryClient({
   const [holdingState, setHoldingState] = useState<HoldingState>({});
   const [isRefreshingVisible, setIsRefreshingVisible] = useState(false);
   const [refreshMessage, setRefreshMessage] = useState("");
+  const [strategyStates, setStrategyStates] = useState<StrategyStateByFundId>({});
+  const [compareIds, setCompareIds] = useState<string[]>([]);
+  const [watchlistIds, setWatchlistIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    const stateMap = readWatchlistStrategyStateMap();
+    setStrategyStates(
+      funds.reduce<StrategyStateByFundId>((nextStates, fund) => {
+        nextStates[fund.fundId] =
+          stateMap[fund.fundId] ?? stateMap[fund.fundCode] ?? stateMap[`fund:${fund.fundCode}`] ?? stateMap[`code-${fund.fundCode}`] ?? stateMap[`user-${fund.fundCode}`];
+        return nextStates;
+      }, {})
+    );
+  }, [funds]);
+
+  useEffect(() => {
+    setCompareIds(readJsonArray(STORAGE_KEYS.compare));
+    setWatchlistIds(readJsonArray(STORAGE_KEYS.watchlist));
+  }, []);
+
+  function toggleStoredId(storageKey: string, itemId: string, nextActive: boolean, maxItems?: number) {
+    const setter = storageKey === STORAGE_KEYS.compare ? setCompareIds : setWatchlistIds;
+    setter((current) => {
+      const next = nextActive
+        ? Array.from(new Set(maxItems ? [...current.slice(-(maxItems - 1)), itemId] : [...current, itemId]))
+        : current.filter((value) => value !== itemId);
+      writeJsonArray(storageKey, next);
+      return next;
+    });
+  }
 
   const themes = useMemo(
     () => ["全部", ...Array.from(new Set(funds.flatMap((fund) => fund.themeAliases?.length ? fund.themeAliases : [fund.theme])))],
@@ -695,6 +771,7 @@ export function FundDiscoveryClient({
                           </span>
                         ))}
                       </div>
+                      <FundStrategyStateNote state={strategyStates[fund.fundId]} compact />
                     </td>
                     <td className="px-5 py-4">{fund.theme}</td>
                     <td className={`px-5 py-4 font-semibold ${(fund.return1d ?? 0) >= 0 ? "text-pine" : "text-rose-700"}`}>
@@ -720,8 +797,8 @@ export function FundDiscoveryClient({
                             {actionState[fund.fundCode] === "collecting" ? "采集中" : "触发采集"}
                           </button>
                         ) : null}
-                        <StorageActionButton storageKey={STORAGE_KEYS.compare} itemId={fund.fundId} idleLabel="加入对比" activeLabel="已加入对比" maxItems={4} />
-                        <StorageActionButton storageKey={STORAGE_KEYS.watchlist} itemId={fund.fundId} idleLabel="加入观察" activeLabel="已加入观察" />
+                        <StorageActionButton storageKey={STORAGE_KEYS.compare} itemId={fund.fundId} idleLabel="加入对比" activeLabel="已加入对比" maxItems={4} active={compareIds.includes(fund.fundId)} onToggle={(id, nextActive) => toggleStoredId(STORAGE_KEYS.compare, id, nextActive, 4)} />
+                        <StorageActionButton storageKey={STORAGE_KEYS.watchlist} itemId={fund.fundId} idleLabel="加入观察" activeLabel="已加入观察" active={watchlistIds.includes(fund.fundId)} onToggle={(id, nextActive) => toggleStoredId(STORAGE_KEYS.watchlist, id, nextActive)} />
                         <button
                           type="button"
                           onClick={() => void toggleHoldings(fund)}
@@ -790,6 +867,7 @@ export function FundDiscoveryClient({
               <p className="mt-4 text-sm leading-7 text-ink/68">
                 {getFundObservationText(fund)}
               </p>
+              <FundStrategyStateNote state={strategyStates[fund.fundId]} />
               <div className="mt-5 flex flex-wrap gap-2">
                 {fund.dataCompleteness === "pending" || fund.dataCompleteness === "failed" ? (
                   <button
@@ -801,8 +879,8 @@ export function FundDiscoveryClient({
                     {actionState[fund.fundCode] === "collecting" ? "采集中" : "触发采集"}
                   </button>
                 ) : null}
-                <StorageActionButton storageKey={STORAGE_KEYS.compare} itemId={fund.fundId} idleLabel="加入对比" activeLabel="已加入对比" maxItems={4} />
-                <StorageActionButton storageKey={STORAGE_KEYS.watchlist} itemId={fund.fundId} idleLabel="加入观察" activeLabel="已加入观察" />
+                <StorageActionButton storageKey={STORAGE_KEYS.compare} itemId={fund.fundId} idleLabel="加入对比" activeLabel="已加入对比" maxItems={4} active={compareIds.includes(fund.fundId)} onToggle={(id, nextActive) => toggleStoredId(STORAGE_KEYS.compare, id, nextActive, 4)} />
+                <StorageActionButton storageKey={STORAGE_KEYS.watchlist} itemId={fund.fundId} idleLabel="加入观察" activeLabel="已加入观察" active={watchlistIds.includes(fund.fundId)} onToggle={(id, nextActive) => toggleStoredId(STORAGE_KEYS.watchlist, id, nextActive)} />
                 <button
                   type="button"
                   onClick={() => void toggleHoldings(fund)}
@@ -878,6 +956,28 @@ function HoldingInsightPanel({ state }: { state?: HoldingState[string] }) {
         </div>
         <p className="mt-4 text-xs leading-6 text-ink/55">{data.disclaimer}</p>
       </div>
+    </div>
+  );
+}
+
+function FundStrategyStateNote({ state, compact = false }: { state?: WatchlistStrategyState; compact?: boolean }) {
+  const riskVetoes = state?.riskVetoes?.filter(Boolean) ?? [];
+
+  return (
+    <div className={`${compact ? "mt-3" : "mt-4"} rounded-xl border border-ink/10 bg-mist/50 p-3 text-xs leading-6 text-ink/65`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`rounded-full px-2 py-1 font-semibold ${getStrategyStageTone(state)}`}>{getStrategyStageLabel(state)}</span>
+        {state?.strategyScore !== null && state?.strategyScore !== undefined ? <span>策略分：{state.strategyScore}</span> : null}
+        {state?.confidence ? <span>置信度：{state.confidence}</span> : null}
+      </div>
+      <p className="mt-2">
+        {state?.reason ?? "尚未进入观察池策略状态；可先加入观察后，在“我的观察”中进行策略复核。"}
+      </p>
+      {riskVetoes.length ? <p className="mt-1 font-semibold text-rose-700">风险 veto：{riskVetoes.join(" / ")}</p> : null}
+      {state?.nextAction ? <p className="mt-1">下一步：{state.nextAction}</p> : null}
+      <Link href="/watchlist" className="mt-2 inline-flex font-semibold text-pine underline-offset-4 hover:underline">
+        去观察池复核
+      </Link>
     </div>
   );
 }

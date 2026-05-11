@@ -1,4 +1,5 @@
 import { fetchBackendJson } from "@/lib/backend-api";
+import { isDemoMode } from "@/lib/data-mode";
 import { compareItems, funds } from "@/mock/data";
 import { FundCompareItem, FundDiscoveryQueryState, FundListItem } from "@/types";
 
@@ -26,15 +27,13 @@ function normalizeFundType(rawType: string | undefined, trackingTarget?: string)
 }
 
 function buildFallbackFundList(theme?: string): FundListItem[] {
-  return (theme ? funds.filter((fund) => fund.theme === theme) : funds).map((fund) => ({
+  return (theme ? funds.filter((fund) => fund.theme === theme || fund.themeAliases?.includes(theme)) : funds).map((fund) => ({
     ...fund,
     dataSource: "演示样例"
   }));
 }
 
-function withFundTags(fund: FundListItem): FundListItem {
-  const fallback = funds.find((item) => item.fundId === fund.fundId);
-
+function withFundTags(fund: FundListItem, fallback?: FundListItem): FundListItem {
   return {
     ...fund,
     tags:
@@ -65,60 +64,81 @@ function buildBackendFundItem(item: Partial<FundListItem>, fallbackItem?: FundLi
     theme: item.theme ?? fallbackItem?.theme ?? "自选基金",
     themeAliases: item.themeAliases ?? fallbackItem?.themeAliases ?? [item.theme ?? fallbackItem?.theme ?? "自选基金"],
     trackingTarget,
-    return1d: item.return1d ?? fallbackItem?.return1d,
-    return1m: item.return1m ?? fallbackItem?.return1m ?? 0,
-    return3m: item.return3m ?? fallbackItem?.return3m ?? 0,
-    return6m: item.return6m ?? fallbackItem?.return6m ?? 0,
-    maxDrawdown: item.maxDrawdown ?? fallbackItem?.maxDrawdown ?? 0,
-    volatility: item.volatility ?? fallbackItem?.volatility ?? 0,
-    aum: item.aum ?? fallbackItem?.aum ?? 0,
-    latestNav: item.latestNav ?? fallbackItem?.latestNav,
-    previousNav: item.previousNav ?? fallbackItem?.previousNav,
-    latestNavDate: item.latestNavDate ?? fallbackItem?.latestNavDate,
-    previousNavDate: item.previousNavDate ?? fallbackItem?.previousNavDate,
-    metricTradeDate: item.metricTradeDate ?? fallbackItem?.metricTradeDate,
-    metricUpdatedAt: item.metricUpdatedAt ?? fallbackItem?.metricUpdatedAt,
-    metricDataVersion: item.metricDataVersion ?? fallbackItem?.metricDataVersion,
-    feeRate: item.feeRate ?? fallbackItem?.feeRate ?? 0,
-    tradableOnExchange: item.tradableOnExchange ?? fallbackItem?.tradableOnExchange ?? (fundCode.startsWith("1") || fundCode.startsWith("5")),
-    tags: fallbackItem?.tags ?? [],
-    foundedYears: item.foundedYears ?? fallbackItem?.foundedYears,
-    fundCompany: item.fundCompany ?? fallbackItem?.fundCompany,
-    feeRuleSummary: item.feeRuleSummary ?? fallbackItem?.feeRuleSummary,
-    holdingCostSummary: item.holdingCostSummary ?? fallbackItem?.holdingCostSummary ?? [],
-    redemptionFeeFreeAfterDays: item.redemptionFeeFreeAfterDays ?? fallbackItem?.redemptionFeeFreeAfterDays,
-    dataSource: item.dataSource ?? fallbackItem?.dataSource ?? "真实快照",
-    dataCompleteness: item.dataCompleteness ?? fallbackItem?.dataCompleteness ?? "complete",
-    missingMetrics: item.missingMetrics ?? fallbackItem?.missingMetrics ?? []
-  });
+    return1d: item.return1d ?? (isDemoMode() ? fallbackItem?.return1d : null),
+    return1m: item.return1m ?? (isDemoMode() ? fallbackItem?.return1m : null),
+    return3m: item.return3m ?? (isDemoMode() ? fallbackItem?.return3m : null),
+    return6m: item.return6m ?? (isDemoMode() ? fallbackItem?.return6m : null),
+    maxDrawdown: item.maxDrawdown ?? (isDemoMode() ? fallbackItem?.maxDrawdown : null),
+    volatility: item.volatility ?? (isDemoMode() ? fallbackItem?.volatility : null),
+    aum: item.aum ?? (isDemoMode() ? fallbackItem?.aum : null),
+    latestNav: item.latestNav ?? (isDemoMode() ? fallbackItem?.latestNav : undefined),
+    previousNav: item.previousNav ?? (isDemoMode() ? fallbackItem?.previousNav : undefined),
+    latestNavDate: item.latestNavDate ?? (isDemoMode() ? fallbackItem?.latestNavDate : undefined),
+    previousNavDate: item.previousNavDate ?? (isDemoMode() ? fallbackItem?.previousNavDate : undefined),
+    metricTradeDate: item.metricTradeDate ?? (isDemoMode() ? fallbackItem?.metricTradeDate : undefined),
+    metricUpdatedAt: item.metricUpdatedAt ?? (isDemoMode() ? fallbackItem?.metricUpdatedAt : undefined),
+    metricDataVersion: item.metricDataVersion ?? (isDemoMode() ? fallbackItem?.metricDataVersion : undefined),
+    feeRate: item.feeRate ?? (isDemoMode() ? fallbackItem?.feeRate : null),
+    tradableOnExchange: item.tradableOnExchange ?? (isDemoMode() ? fallbackItem?.tradableOnExchange : undefined) ?? (fundCode.startsWith("1") || fundCode.startsWith("5")),
+    tags: isDemoMode() ? fallbackItem?.tags ?? [] : [],
+    foundedYears: item.foundedYears ?? (isDemoMode() ? fallbackItem?.foundedYears : undefined),
+    fundCompany: item.fundCompany ?? (isDemoMode() ? fallbackItem?.fundCompany : undefined),
+    feeRuleSummary: item.feeRuleSummary ?? (isDemoMode() ? fallbackItem?.feeRuleSummary : undefined),
+    holdingCostSummary: item.holdingCostSummary ?? (isDemoMode() ? fallbackItem?.holdingCostSummary : undefined) ?? [],
+    redemptionFeeFreeAfterDays: item.redemptionFeeFreeAfterDays ?? (isDemoMode() ? fallbackItem?.redemptionFeeFreeAfterDays : undefined),
+    dataSource: item.dataSource ?? (isDemoMode() ? fallbackItem?.dataSource : undefined) ?? "真实快照",
+    dataCompleteness: item.dataCompleteness ?? (isDemoMode() ? fallbackItem?.dataCompleteness : undefined) ?? "complete",
+    missingMetrics: item.missingMetrics ?? (isDemoMode() ? fallbackItem?.missingMetrics : undefined) ?? []
+  }, isDemoMode() ? fallbackItem : undefined);
 }
 
 function isDemoFundItem(fund: FundListItem) {
   return String(fund.dataSource ?? "") === "演示样例" || /^f\d+$/i.test(fund.fundId);
 }
 
+function fundIdentityKeys(fund: Pick<FundListItem, "fundId" | "fundCode">) {
+  return [fund.fundId, fund.fundCode, fund.fundCode ? `user-${fund.fundCode}` : null, fund.fundCode ? `code-${fund.fundCode}` : null].filter(Boolean) as string[];
+}
+
+function hasBackendEquivalent(fund: FundListItem, backendKeys: Set<string>) {
+  return fundIdentityKeys(fund).some((key) => backendKeys.has(key));
+}
+
 export async function getFundListView(theme?: string): Promise<FundListItem[]> {
   const tagFallback = buildFallbackFundList(theme);
+  const allFallback = buildFallbackFundList();
+  const fallbackById = new Map(allFallback.flatMap((fund) => fundIdentityKeys(fund).map((key) => [key, fund])));
+  const demoMode = isDemoMode();
 
   try {
-    const response = await fetchBackendJson<FundsResponse>("/api/funds");
+    const response = await fetchBackendJson<FundsResponse>("/api/funds", { revalidate: 60 });
     const items = response.snapshot?.items;
 
     if (!items || items.length === 0) {
-      return [];
+      return demoMode ? tagFallback : [];
     }
 
     const normalized = items.map((item) => {
-      const fallbackItem = tagFallback.find((fund) => fund.fundId === item.fundId) ?? buildFallbackFundList().find((fund) => fund.fundId === item.fundId);
+      const fallbackItem = [item.fundId, item.fundCode]
+        .filter(Boolean)
+        .map((key) => fallbackById.get(key as string))
+        .find(Boolean);
 
-      return buildBackendFundItem(item, fallbackItem);
+      return buildBackendFundItem(item, demoMode ? fallbackItem : undefined);
     });
 
     const filtered = normalized.filter((item): item is FundListItem => Boolean(item) && !isDemoFundItem(item));
+    const merged = demoMode
+      ? (() => {
+          const backendKeys = new Set(filtered.flatMap(fundIdentityKeys));
+          const fallbackOnly = tagFallback.filter((fund) => !hasBackendEquivalent(fund, backendKeys));
+          return [...filtered, ...fallbackOnly];
+        })()
+      : filtered;
 
-    return theme ? filtered.filter((fund) => fund.theme === theme || fund.themeAliases?.includes(theme)) : filtered;
+    return theme ? merged.filter((fund) => fund.theme === theme || fund.themeAliases?.includes(theme)) : merged;
   } catch {
-    return [];
+    return demoMode ? tagFallback : [];
   }
 }
 

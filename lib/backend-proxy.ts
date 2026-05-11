@@ -4,9 +4,13 @@ export function getBackendBaseUrl(): string {
   return process.env.API_BASE_URL ?? process.env.NEXT_PUBLIC_API_BASE_URL ?? DEFAULT_BACKEND_BASE_URL;
 }
 
-export async function fetchBackendRoute(path: string): Promise<Response> {
+export type BackendRouteFetchOptions = {
+  revalidate?: number;
+};
+
+export async function fetchBackendRoute(path: string, options: BackendRouteFetchOptions = {}): Promise<Response> {
   return fetch(`${getBackendBaseUrl()}${path}`, {
-    cache: "no-store",
+    ...(options.revalidate !== undefined ? { next: { revalidate: options.revalidate } } : { cache: "no-store" as const }),
     headers: {
       Accept: "application/json"
     }

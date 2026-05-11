@@ -4,9 +4,13 @@ function getApiBaseUrl(): string {
   return process.env.API_BASE_URL ?? process.env.NEXT_PUBLIC_API_BASE_URL ?? DEFAULT_API_BASE_URL;
 }
 
-export async function fetchBackendJson<T>(path: string): Promise<T> {
+export type BackendFetchOptions = {
+  revalidate?: number;
+};
+
+export async function fetchBackendJson<T>(path: string, options: BackendFetchOptions = {}): Promise<T> {
   const response = await fetch(`${getApiBaseUrl()}${path}`, {
-    cache: "no-store",
+    ...(options.revalidate !== undefined ? { next: { revalidate: options.revalidate } } : { cache: "no-store" as const }),
     headers: {
       Accept: "application/json"
     }

@@ -57,8 +57,8 @@ THEME_PROFILES = [
     {
         "decisionTheme": "AI算力/CPO/人工智能",
         "assetStyle": "high_beta",
-        "industryId": "ai-infra",
-        "keywords": ("CPO", "人工智能", "AI", "算力", "机器人"),
+        "industryId": "cpo-optical-communication",
+        "keywords": ("CPO", "光模块", "光通信", "通信设备", "高速互联", "AI", "算力"),
         "intent": "高弹性成长主题，短期波动大，需要趋势确认和回撤阈值。",
     },
     {
@@ -273,10 +273,14 @@ def _classify_asset_profile(fund_name: str, theme: str, fund_type: str) -> dict:
 
 
 def _build_summary(valuations: list[dict]) -> dict:
-    total_market = sum(item["marketValue"] or 0 for item in valuations)
-    total_cost = sum(item["costValue"] or 0 for item in valuations)
-    total_day_profit = sum(item["dayProfit"] or 0 for item in valuations)
-    total_holding_profit = sum(item["holdingProfit"] or 0 for item in valuations)
+    total_market = sum(item["marketValue"] for item in valuations if item["marketValue"] is not None)
+    total_cost = sum(item["costValue"] for item in valuations if item["costValue"] is not None)
+    total_day_profit = sum(item["dayProfit"] for item in valuations if item["dayProfit"] is not None)
+    total_holding_profit = sum(item["holdingProfit"] for item in valuations if item["holdingProfit"] is not None)
+    market_value_unknown_count = sum(1 for item in valuations if item["marketValue"] is None)
+    cost_value_unknown_count = sum(1 for item in valuations if item["costValue"] is None)
+    day_profit_unknown_count = sum(1 for item in valuations if item["dayProfit"] is None)
+    holding_profit_unknown_count = sum(1 for item in valuations if item["holdingProfit"] is None)
     enhanced_count = sum(1 for item in valuations if item["dataQuality"] == "enhanced")
     partial_count = sum(1 for item in valuations if item["dataQuality"] in {"partial", "partial_nav"})
     snapshot_only_count = sum(1 for item in valuations if item["dataQuality"] == "snapshot_only")
@@ -293,6 +297,10 @@ def _build_summary(valuations: list[dict]) -> dict:
             "partialCount": partial_count,
             "snapshotOnlyCount": snapshot_only_count,
             "enhancedRatio": _round(enhanced_count / len(valuations) * 100, 2) if valuations else 0,
+            "marketValueUnknownCount": market_value_unknown_count,
+            "costValueUnknownCount": cost_value_unknown_count,
+            "dayProfitUnknownCount": day_profit_unknown_count,
+            "holdingProfitUnknownCount": holding_profit_unknown_count,
         },
     }
 
@@ -303,8 +311,12 @@ def _build_diagnosis(valuations: list[dict], summary: dict) -> dict:
     theme_values: dict[str, float] = defaultdict(float)
     fund_type_values: dict[str, float] = defaultdict(float)
     decision_theme_values: dict[str, float] = defaultdict(float)
+    unknown_market_value_count = 0
     for item in valuations:
-        market_value = item["marketValue"] or 0
+        if item["marketValue"] is None:
+            unknown_market_value_count += 1
+            continue
+        market_value = item["marketValue"]
         theme_values[item["theme"] or "未匹配"] += market_value
         fund_type_values[item["fundType"] or "待匹配"] += market_value
         decision_theme_values[item["decisionTheme"] or "未分类"] += market_value
@@ -321,8 +333,13 @@ def _build_diagnosis(valuations: list[dict], summary: dict) -> dict:
         {"theme": theme, "marketValue": _round(value), "ratio": _round(value / total_market * 100, 2) if total_market else 0}
         for theme, value in sorted(decision_theme_values.items(), key=lambda pair: pair[1], reverse=True)
     ]
-    qdii_value = sum((item["marketValue"] or 0) for item in valuations if "QDII" in (item["fundType"] or "").upper() or "全球" in item["fundName"] or "海外" in item["fundName"])
-    largest = max(valuations, key=lambda item: item["marketValue"] or 0, default=None)
+    qdii_value = sum(
+        item["marketValue"]
+        for item in valuations
+        if item["marketValue"] is not None and ("QDII" in (item["fundType"] or "").upper() or "全球" in item["fundName"] or "海外" in item["fundName"])
+    )
+    known_market_valuations = [item for item in valuations if item["marketValue"] is not None]
+    largest = max(known_market_valuations, key=lambda item: item["marketValue"], default=None)
     enriched = [_attach_decision_evidence(item, industry_contexts, total_market) for item in valuations]
     long_hold_review = [item for item in enriched if item["assetStyle"] == "long_hold"]
     high_beta_review = [item for item in enriched if item["assetStyle"] == "high_beta"]
@@ -337,7 +354,7 @@ def _build_diagnosis(valuations: list[dict], summary: dict) -> dict:
         "largestPosition": {
             "fundName": largest["fundName"],
             "fundCode": largest["fundCode"],
-            "ratio": _round((largest["marketValue"] or 0) / total_market * 100, 2) if total_market else 0,
+            "ratio": _round(largest["marketValue"] / total_market * 100, 2) if total_market else 0,
         } if largest else None,
         "longHoldReview": long_hold_review,
         "highBetaReview": high_beta_review,
@@ -352,7 +369,7 @@ def _build_diagnosis(valuations: list[dict], summary: dict) -> dict:
                 "趋势破坏": "基金多周期走弱，同时行业趋势或资金/估值证据也偏弱，才进入更强风险提示。",
             },
         },
-        "dataQuality": summary["quality"],
+        "dataQuality": {**summary["quality"], "marketValueUnknownCount": unknown_market_value_count},
     }
 
 
@@ -407,7 +424,7 @@ def _load_industry_contexts() -> dict[str, dict]:
 
 def _attach_decision_evidence(item: dict, industry_contexts: dict[str, dict], total_market: float) -> dict:
     industry_context = industry_contexts.get(item.get("industryId") or "") if item.get("industryId") else None
-    position_ratio = _round((item["marketValue"] or 0) / total_market * 100, 2) if total_market else 0
+    position_ratio = _round(item["marketValue"] / total_market * 100, 2) if item["marketValue"] is not None and total_market else 0
     decision = _evaluate_position_decision(item, industry_context, position_ratio)
     review = _build_review_base(item)
     review.update(
@@ -437,6 +454,7 @@ def _evaluate_position_decision(item: dict, industry_context: dict | None, posit
     positive_points = 0
     reasons: list[str] = []
     missing: list[str] = []
+    risk_vetoes: list[str] = []
 
     if return_1d is not None and return_1d <= -2:
         risk_points += 1
@@ -469,9 +487,15 @@ def _evaluate_position_decision(item: dict, industry_context: dict | None, posit
             positive_points += 1
             reasons.append(f"近 6 月 {return_6m:.2f}%，中期表现仍有延续。")
 
-    if max_drawdown is not None and max_drawdown <= -20:
+    if max_drawdown is not None and max_drawdown <= -12:
         risk_points += 1
-        reasons.append(f"最大回撤 {max_drawdown:.2f}%，回撤压力偏高。")
+        reasons.append(f"最大回撤 {max_drawdown:.2f}%，已进入控仓观察区。")
+        if max_drawdown <= -18:
+            risk_points += 1
+            risk_vetoes.append("最大回撤超过 -18%，新增仓位需要等待趋势修复。")
+        if max_drawdown <= -25:
+            risk_points += 2
+            risk_vetoes.append("最大回撤超过 -25%，触发强风控复盘，不应等到此时才开始减仓判断。")
     if volatility is not None and volatility >= 28:
         risk_points += 1
         reasons.append(f"波动率 {volatility:.2f}%，属于高波动。")
@@ -501,6 +525,16 @@ def _evaluate_position_decision(item: dict, industry_context: dict | None, posit
         missing.append("行业趋势/资金/估值证据")
         reasons.append("行业证据暂缺，本次判断不会把短期涨跌直接升级为趋势破坏。")
 
+    position_limit = _position_limit_for_item(item)
+    if position_ratio >= position_limit * 1.35:
+        risk_points += 2
+        risk_vetoes.append(f"单只占比 {position_ratio:.2f}% 明显超过建议上限 {position_limit:.0f}%，优先控仓而不是加仓。")
+        reasons.append(f"单只占比 {position_ratio:.2f}%，集中度偏高。")
+    elif position_ratio >= position_limit:
+        risk_points += 1
+        risk_vetoes.append(f"单只占比已达到建议上限 {position_limit:.0f}% 附近，新增资金需要谨慎。")
+        reasons.append(f"单只占比 {position_ratio:.2f}%，接近仓位上限。")
+
     if trend_points >= 3 and industry_points >= 2:
         decision_level = "趋势破坏"
         action = "多周期趋势与行业证据同时偏弱，适合重点复盘是否降低仓位；执行前仍需结合你的长期目标和成本。"
@@ -518,7 +552,7 @@ def _evaluate_position_decision(item: dict, industry_context: dict | None, posit
         action = "证据尚不充分，继续跟踪基金净值、行业趋势、回撤和费用。"
 
     confidence = "高" if industry_context and not missing and (trend_points + risk_points + positive_points) >= 3 else "中" if len(missing) <= 1 else "低"
-    score = max(0, min(100, 55 + positive_points * 8 - trend_points * 12 - risk_points * 7 - industry_points * 10))
+    score = max(0, min(100, 55 + positive_points * 8 - trend_points * 12 - risk_points * 8 - industry_points * 10))
 
     if item["assetStyle"] == "long_hold" and decision_level in {"短期波动", "阶段转弱"}:
         action = f"{action} 这是长期/海外资产，优先确认海外市场和汇率因素，不因单日净值延迟频繁操作。"
@@ -534,6 +568,19 @@ def _evaluate_position_decision(item: dict, industry_context: dict | None, posit
         risk_points=risk_points,
         positive_points=positive_points,
         missing=missing,
+        risk_vetoes=risk_vetoes,
+    )
+    committee = _build_decision_committee(
+        item=item,
+        industry_context=industry_context,
+        position_ratio=position_ratio,
+        position_limit=position_limit,
+        decision_level=decision_level,
+        score=score,
+        trend_points=trend_points,
+        risk_points=risk_points,
+        positive_points=positive_points,
+        risk_vetoes=risk_vetoes,
     )
 
     return {
@@ -542,9 +589,95 @@ def _evaluate_position_decision(item: dict, industry_context: dict | None, posit
         "confidence": confidence,
         "evidenceSummary": reasons[:6],
         "missingEvidence": missing,
+        "riskVetoes": risk_vetoes,
+        "positionLimit": position_limit,
+        **committee,
         **operation,
         "action": action,
         "trendLabel": decision_level,
+    }
+
+
+def _position_limit_for_item(item: dict) -> float:
+    asset_style = item.get("assetStyle")
+    if asset_style == "high_beta":
+        return 8.0
+    if asset_style == "long_hold":
+        return 18.0
+    return 12.0
+
+
+def _build_decision_committee(
+    *,
+    item: dict,
+    industry_context: dict | None,
+    position_ratio: float,
+    position_limit: float,
+    decision_level: str,
+    score: float,
+    trend_points: int,
+    risk_points: int,
+    positive_points: int,
+    risk_vetoes: list[str],
+) -> dict:
+    return_1m = item.get("return1m")
+    return_3m = item.get("return3m")
+    return_6m = item.get("return6m")
+    max_drawdown = item.get("maxDrawdown")
+    volatility = item.get("volatility")
+    trend_score = industry_context.get("trendScore") if industry_context else None
+
+    aggressive_case = "趋势证据不足，暂不支持进攻。"
+    if positive_points >= 3 and return_3m is not None and return_6m is not None:
+        aggressive_case = f"近3月 {return_3m:.2f}%、近6月 {return_6m:.2f}%，中期趋势仍有进攻价值。"
+    elif return_1m is not None and return_1m >= 8:
+        aggressive_case = f"近1月 {return_1m:.2f}%，短线动量仍强，但需要确认不是追高。"
+
+    neutral_case = "维持观察，等待更多行业与净值证据。"
+    if trend_score is not None:
+        neutral_case = f"行业趋势分 {trend_score:.0f}，结合仓位 {position_ratio:.2f}% 和波动来决定是否只持有不加仓。"
+    if position_ratio >= position_limit:
+        neutral_case = f"仓位 {position_ratio:.2f}% 已接近/超过建议上限 {position_limit:.0f}%，即使趋势强也优先做再平衡。"
+
+    conservative_case = "暂无硬性风控否决，但仍需设置回撤和仓位上限。"
+    if risk_vetoes:
+        conservative_case = risk_vetoes[0]
+    elif max_drawdown is not None and max_drawdown <= -12:
+        conservative_case = f"最大回撤 {max_drawdown:.2f}% 已进入观察区，新增仓位需要更高确认度。"
+    elif volatility is not None and volatility >= 28:
+        conservative_case = f"波动率 {volatility:.2f}% 偏高，分批和仓位上限比追求收益更重要。"
+
+    rating = "Hold"
+    rating_label = "持有"
+    if risk_vetoes and position_ratio >= position_limit:
+        rating = "Underweight"
+        rating_label = "降配"
+    elif decision_level == "趋势破坏":
+        rating = "Underweight"
+        rating_label = "降配"
+    elif decision_level == "阶段转弱":
+        rating = "Hold"
+        rating_label = "暂停加仓"
+    elif positive_points >= 4 and score >= 75 and position_ratio < position_limit * 0.75 and not risk_vetoes:
+        rating = "Overweight"
+        rating_label = "小幅增配观察"
+    elif positive_points >= 2 and not risk_vetoes:
+        rating = "Hold"
+        rating_label = "持有"
+
+    if trend_points >= 3 and risk_points >= 3:
+        rating = "Sell"
+        rating_label = "退出/大幅降配复盘"
+
+    return {
+        "portfolioRating": rating,
+        "portfolioRatingLabel": rating_label,
+        "decisionCommittee": {
+            "aggressiveCase": aggressive_case,
+            "neutralCase": neutral_case,
+            "conservativeCase": conservative_case,
+            "finalView": f"{rating_label}：先尊重趋势证据，但由仓位上限和风险否决项决定是否能加仓。",
+        },
     }
 
 
@@ -558,12 +691,18 @@ def _build_operation_signal(
     risk_points: int,
     positive_points: int,
     missing: list[str],
+    risk_vetoes: list[str],
 ) -> dict:
     asset_style = item.get("assetStyle")
     return_1m = item.get("return1m")
     return_3m = item.get("return3m")
 
-    if missing and len(missing) >= 2:
+    if risk_vetoes and position_ratio >= _position_limit_for_item(item):
+        signal = "控仓优先"
+        signal_strength = "high"
+        buy_watch_score = min(score, 35)
+        reason = risk_vetoes[0]
+    elif missing and len(missing) >= 2:
         signal = "数据不足，先补证据"
         signal_strength = "low"
         buy_watch_score = min(score, 45)

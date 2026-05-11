@@ -1,0 +1,4 @@
+export const MOCK_SNAPSHOT_DATE = "2026-04-21";
+export const MOCK_SNAPSHOT_UPDATED_AT = "2026-04-21 10:00";
+export const MOCK_SNAPSHOT_UPDATED_AT_ISO = "2026-04-21T10:00:00+08:00";
+export const MOCK_DATA_VERSION = "mock-v1";

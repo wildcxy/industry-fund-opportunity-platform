@@ -2,6 +2,7 @@ industry_id,performance_5d,performance_20d,performance_60d,trend_score,capital_s
 semiconductor,4.8,11.6,18.3,82,88,71,63,中,12
 innovative-medicine,2.4,8.1,12.5,73,75,85,56,中,9
 ai-infra,6.2,14.4,20.1,89,91,58,82,高,7
+cpo-optical-communication,5.4,13.2,19.6,86,84,62,78,高,6
 chemical,1.6,5.8,9.2,66,62,78,58,中,8
 gaming,3.2,9.4,13.6,76,73,64,72,高,6
 global-qdii,2.1,7.9,18.8,74,69,61,68,中,10

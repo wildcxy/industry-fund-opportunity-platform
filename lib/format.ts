@@ -1,4 +1,8 @@
-export function formatPercent(value: number) {
+export function formatPercent(value?: number | null) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "--";
+  }
+
   return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 

@@ -131,6 +131,12 @@ def _build_freshness(holdings: list[dict]) -> dict:
     }
 
 
+def _float_or_none(value) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
 def _infer_rebalance(fund: dict | None, metrics: dict | None, holdings: list[dict]) -> list[dict]:
     if not metrics:
         return [
@@ -143,10 +149,20 @@ def _infer_rebalance(fund: dict | None, metrics: dict | None, holdings: list[dic
         ]
 
     theme = fund["theme"] or fund["tracking_target"]
-    return_1m = float(metrics["return_1m"] or 0)
-    return_3m = float(metrics["return_3m"] or 0)
-    drawdown = float(metrics["max_drawdown"] or 0)
+    return_1m = _float_or_none(metrics["return_1m"])
+    return_3m = _float_or_none(metrics["return_3m"])
+    drawdown = _float_or_none(metrics["max_drawdown"])
     holding_names = "、".join(item["holdingName"] for item in holdings[:5]) or "官方持仓待补充"
+
+    if return_1m is None or return_3m is None or drawdown is None:
+        return [
+            {
+                "direction": "insufficient_data",
+                "label": "推测数据不足",
+                "confidence": 25,
+                "evidence": "近 1 月、近 3 月或最大回撤指标缺失，系统不会把缺失值当作 0 来推测调仓方向。",
+            }
+        ]
 
     if return_1m >= 5 and return_3m >= 10:
         return [

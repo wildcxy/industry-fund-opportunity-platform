@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { STORAGE_KEYS } from "@/lib/storage";
 import { PortfolioDecisionAssistView, PortfolioPosition } from "@/types";
@@ -47,6 +47,47 @@ function decisionLevelClass(level?: string) {
   if (level === "短期波动") return "bg-orange-100 text-orange-800";
   if (level === "趋势仍有支撑") return "bg-emerald-100 text-emerald-800";
   return "bg-white text-pine";
+}
+
+type PortfolioReviewItem = NonNullable<NonNullable<PortfolioDecisionAssistView["diagnosis"]>["longHoldReview"]>[number];
+
+function uniqueReviewItems(items: PortfolioReviewItem[]) {
+  const unique = new Map<string, PortfolioReviewItem>();
+  items.forEach((item) => {
+    const key = item.fundCode ?? item.fundName;
+    if (!unique.has(key)) {
+      unique.set(key, item);
+    }
+  });
+  return Array.from(unique.values());
+}
+
+function buildPlanDraftReviewItems(view: PortfolioDecisionAssistView | null) {
+  const diagnosis = view?.diagnosis;
+  const reviewItems = uniqueReviewItems([
+    ...(diagnosis?.trendWatchList ?? []),
+    ...(diagnosis?.highBetaReview ?? []),
+    ...(diagnosis?.longHoldReview ?? [])
+  ]);
+
+  return reviewItems
+    .filter((item) => item.decisionScore !== undefined || item.buyWatchScore !== undefined || item.riskVetoes?.length)
+    .sort((left, right) => (right.buyWatchScore ?? -1) - (left.buyWatchScore ?? -1) || (right.decisionScore ?? -1) - (left.decisionScore ?? -1))
+    .slice(0, 6);
+}
+
+function planDraftStatus(item: PortfolioReviewItem) {
+  if (item.riskVetoes?.length) return "风险阻断";
+  if ((item.buyWatchScore ?? 0) >= 80 && (item.decisionScore ?? 0) >= 70) return "可复核草稿";
+  if ((item.buyWatchScore ?? 0) >= 65) return "继续观察";
+  return "暂不生成";
+}
+
+function planDraftStatusClass(status: string) {
+  if (status === "风险阻断") return "bg-rose-100 text-rose-800";
+  if (status === "可复核草稿") return "bg-emerald-100 text-emerald-800";
+  if (status === "继续观察") return "bg-amber-100 text-amber-800";
+  return "bg-white text-ink/65";
 }
 
 function buildStrategyActions(view: PortfolioDecisionAssistView | null) {
@@ -164,6 +205,7 @@ export function PortfolioDecisionPanel() {
   const trendWatchList = diagnosis?.trendWatchList ?? [];
   const industryEvidence = diagnosis?.industryEvidence ?? [];
   const methodology = diagnosis?.decisionMethodology;
+  const planDraftReviewItems = useMemo(() => buildPlanDraftReviewItems(view), [view]);
 
   return (
     <section className="panel p-6">
@@ -274,6 +316,57 @@ export function PortfolioDecisionPanel() {
             </div>
           ))}
         </div>
+      </div>
+
+      <div className="mt-6 rounded-2xl bg-white p-5 ring-1 ring-ink/10">
+        <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <p className="text-sm font-semibold">策略评分与计划草稿复核</p>
+            <p className="mt-2 text-xs leading-5 text-ink/55">
+              这里把持仓中的策略分、买入观察分和风控否决放在一起，只用于判断是否值得进入草稿复核，不自动生成交易动作。
+            </p>
+          </div>
+          <span className="rounded-full bg-mist px-3 py-1 text-xs font-semibold text-pine">
+            {planDraftReviewItems.length} 项待看
+          </span>
+        </div>
+        {planDraftReviewItems.length ? (
+          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {planDraftReviewItems.map((item) => {
+              const status = planDraftStatus(item);
+              return (
+                <div key={`${item.fundCode}-${item.fundName}`} className="rounded-xl bg-mist/50 p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <p className="font-semibold">{item.fundName}</p>
+                      <p className="mt-1 text-xs text-ink/50">{item.fundCode ?? "未匹配代码"} / {item.decisionTheme ?? item.theme ?? "未识别主题"}</p>
+                    </div>
+                    <span className={`rounded-full px-2 py-1 text-xs font-semibold ${planDraftStatusClass(status)}`}>{status}</span>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                    <span className="rounded-full bg-white px-2 py-1">策略分 {formatPlainNumber(item.decisionScore)}</span>
+                    <span className="rounded-full bg-white px-2 py-1">买入观察 {formatPlainNumber(item.buyWatchScore)}</span>
+                    <span className="rounded-full bg-white px-2 py-1">仓位上限 {formatPercent(item.positionLimit)}</span>
+                    <span className="rounded-full bg-white px-2 py-1">置信度 {item.confidence ?? "--"}</span>
+                  </div>
+                  {item.riskVetoes?.length ? (
+                    <p className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">
+                      风控否决：{item.riskVetoes.slice(0, 2).join("；")}
+                    </p>
+                  ) : (
+                    <p className="mt-3 text-xs leading-5 text-ink/58">
+                      {item.operationReason ?? item.action ?? "暂无明确草稿触发条件，继续等待证据补充。"}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <p className="mt-4 rounded-xl bg-mist/60 p-4 text-sm text-ink/55">
+            暂无可展示的策略评分或计划草稿信息。请先同步持仓并生成策略。
+          </p>
+        )}
       </div>
 
       <div className="mt-6 grid gap-4 lg:grid-cols-[1fr_1fr]">
@@ -411,8 +504,29 @@ function StrategyReviewCard({ item }: { item: NonNullable<NonNullable<PortfolioD
               {item.operationSignal}
             </span>
             <span className="text-xs text-ink/50">强度：{item.signalStrength ?? "--"}</span>
+            {item.portfolioRatingLabel ? (
+              <span className="rounded-full bg-mist px-3 py-1 text-xs font-semibold text-pine">
+                {item.portfolioRatingLabel}
+              </span>
+            ) : null}
           </div>
           <p className="mt-2 text-xs leading-5 text-ink/62">{item.operationReason}</p>
+        </div>
+      ) : null}
+      {item.decisionCommittee ? (
+        <div className="mt-3 rounded-xl bg-white p-3 ring-1 ring-ink/8">
+          <p className="text-xs font-semibold text-ink">多方决策校验</p>
+          <div className="mt-2 space-y-2 text-xs leading-5 text-ink/62">
+            {item.decisionCommittee.aggressiveCase ? <p>进攻方：{item.decisionCommittee.aggressiveCase}</p> : null}
+            {item.decisionCommittee.neutralCase ? <p>中性方：{item.decisionCommittee.neutralCase}</p> : null}
+            {item.decisionCommittee.conservativeCase ? <p>风控方：{item.decisionCommittee.conservativeCase}</p> : null}
+            {item.decisionCommittee.finalView ? <p className="font-semibold text-pine">裁决：{item.decisionCommittee.finalView}</p> : null}
+          </div>
+        </div>
+      ) : null}
+      {item.riskVetoes?.length ? (
+        <div className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">
+          风控否决：{item.riskVetoes.slice(0, 2).join("；")}
         </div>
       ) : null}
       {item.assetIntent ? <p className="mt-3 text-xs leading-5 text-ink/55">{item.assetIntent}</p> : null}
